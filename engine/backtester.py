@@ -322,8 +322,8 @@ class BacktestEngine:
                 from indicators.smc import analyze_smc_structure
 
                 bias = analyze_smc_structure(df_override=hourly_window).get("structure", "Neutral")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("HTF bias fallback failed: %s", exc)
         if bias == "Neutral" and levels.get("weekly_open"):
             price = float(history.iloc[-1]["close"])
             weekly_open = levels.get("weekly_open")

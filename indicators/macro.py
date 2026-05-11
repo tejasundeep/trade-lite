@@ -1,8 +1,11 @@
 import asyncio
 import time
 import copy
+import logging
 import requests
 from .market_context import is_backtest
+
+log = logging.getLogger(__name__)
 
 _cache: dict = {"data": None, "ts": 0.0}
 _TTL = 300  # 5-minute cache — macro data doesn't change tick-by-tick
@@ -21,15 +24,15 @@ def _fetch_sync() -> dict:
         if r.status_code == 200:
             d = r.json()["data"][0]
             result["sentiment"] = {"score": int(d["value"]), "label": d["value_classification"]}
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Macro sentiment fetch failed: %s", exc)
     try:
         r = requests.get("https://api.coingecko.com/api/v3/global", timeout=4)
         if r.status_code == 200:
             btc_dom = r.json().get("data", {}).get("market_cap_percentage", {}).get("btc", 52.0)
             result["dominance"]["btc"] = float(btc_dom)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Macro dominance fetch failed: %s", exc)
     return result
 
 async def get_macro_analysis() -> dict:

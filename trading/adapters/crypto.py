@@ -283,7 +283,7 @@ class CCXTCryptoAdapter:
     # Account, positions, and orders
     # ------------------------------------------------------------------
     def get_account_balance(self) -> Dict:
-        if self.paper_trading and not (self.api_key and self.secret):
+        if self.paper_trading:
             return {
                 "free": {"USDT": self._paper_balance},
                 "locked": {"USDT": 0.0},
@@ -456,19 +456,10 @@ class CCXTCryptoAdapter:
         if self.trading_mode == "futures":
             return self.place_market_order(symbol, side, amount, reduce_only=False)
 
-        return self._signed_request(
-            "POST",
-            "/api/v3/order",
-            {
-                "symbol": m_symbol,
-                "side": side.upper(),
-                "type": "LIMIT",
-                "timeInForce": "GTC",
-                "quantity": quantity,
-                "price": limit_price,
-                "newOrderRespType": "FULL",
-            },
-        )
+        # Use market semantics for live spot entries so the local position state
+        # remains aligned with the actual exchange fill. Limit entries can sit
+        # open indefinitely and break the protective-exit flow.
+        return self.place_market_order(symbol, side, amount, reduce_only=False)
 
     def _place_spot_oco_exit(self, symbol: str, side: str, quantity: str, stop_loss: float, take_profit: float) -> Dict:
         m_symbol = self.get_market_symbol(symbol)

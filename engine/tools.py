@@ -30,6 +30,7 @@ class TradingTools:
         leverage: int = 3,
         margin_type: str = "ISOLATED",
         position_mode: str = "ONE_WAY",
+        max_daily_loss_pct: float = 0.05,
     ):
         self.adapter = CCXTCryptoAdapter(
             exchange_id=exchange_id,
@@ -43,6 +44,7 @@ class TradingTools:
         )
         self._day_balance: Optional[float] = None
         self._snap_date:   Optional[date]  = None
+        self.max_daily_loss_pct = max(float(max_daily_loss_pct or 0.0), 0.0)
 
     def get_day_balance_snapshot(self) -> float:
         return self._get_day_balance_snapshot()
@@ -250,10 +252,18 @@ class TradingTools:
                 log.warning("Market data for %s missing column %s", symbol, col)
                 return pd.DataFrame(columns=expected)
 
-        df["EMA_50"]  = df["close"].ewm(span=50,  adjust=False).mean()
-        df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
-        set_market_data(df)
-        return df
+        frame = df.copy()
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+        for col in ["open", "high", "low", "close", "volume"]:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        frame = frame.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"]).sort_values("timestamp").reset_index(drop=True)
+        if frame.empty:
+            return pd.DataFrame(columns=expected)
+
+        frame["EMA_50"]  = frame["close"].ewm(span=50,  adjust=False).mean()
+        frame["EMA_200"] = frame["close"].ewm(span=200, adjust=False).mean()
+        set_market_data(frame)
+        return frame
 
     def get_institutional_levels(self, symbol: str) -> Dict:
         try:
@@ -295,7 +305,12 @@ class TradingTools:
             key = f"day_balance_{today}"
             row = session.query(SystemState).filter_by(key=key).first()
             if row:
-                self._day_balance = float(json.loads(row.value))
+                try:
+                    self._day_balance = float(json.loads(row.value))
+                except Exception:
+                    self._day_balance = self.get_balance()
+                    row.value = json.dumps(self._day_balance)
+                    session.commit()
             else:
                 snap = self.get_balance()
                 session.merge(SystemState(key=key, value=json.dumps(snap)))
@@ -482,7 +497,7 @@ class TradingTools:
         try:
             today_pnl = self.get_todays_realized_pnl()
             day_balance = self._get_day_balance_snapshot()
-            if today_pnl <= -(day_balance * 0.05):
+            if today_pnl <= -(day_balance * self.max_daily_loss_pct):
                 return {"error": "Daily loss limit reached. Trading suspended."}
 
             m_symbol = self.adapter.get_market_symbol(symbol)

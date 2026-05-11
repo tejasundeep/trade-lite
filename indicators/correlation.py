@@ -5,8 +5,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import ccxt
 import numpy as np
 import pandas as pd
+import logging
 
 from trading.adapters.crypto import CCXTCryptoAdapter
+
+log = logging.getLogger(__name__)
 
 
 def _candidate_symbols(symbol: str, venue: str) -> List[str]:
@@ -38,7 +41,8 @@ def _fetch_last_price(exchange, candidates: Iterable[str]) -> Tuple[Optional[flo
             price = float(ticker.get("last") or ticker.get("close") or 0.0)
             if price > 0:
                 return price, candidate
-        except Exception:
+        except Exception as exc:
+            log.debug("Ticker fetch failed for %s: %s", candidate, exc)
             continue
     return None, None
 
@@ -58,7 +62,8 @@ def analyze_cross_exchange_correlation(symbol: str = "BTC/USDT") -> dict:
             if price is not None and resolved is not None:
                 prices[name] = price
                 resolved_symbols[name] = resolved
-        except Exception:
+        except Exception as exc:
+            log.debug("Cross-exchange fetch failed for %s: %s", name, exc)
             continue
 
     if len(prices) < 2:

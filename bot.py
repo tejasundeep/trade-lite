@@ -89,6 +89,7 @@ class TradeXProClone:
             leverage=leverage,
             margin_type=margin_type,
             position_mode=position_mode,
+            max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05")),
         )
         self.risk = MarketRiskManager(MarketRiskConfig(
             max_risk_per_trade_pct=float(os.getenv("MAX_RISK_PER_TRADE_PCT", 0.015)),
@@ -482,6 +483,7 @@ class TradeXProClone:
             with Live(layout, refresh_per_second=4, screen=False):
                 while True:
                     t0 = time.monotonic()
+                    cycle_ok = False
                     try:
                         self.stats["cycles"] += 1
                         # 1. Real-time Balance is handled via callbacks.
@@ -561,6 +563,7 @@ class TradeXProClone:
                         state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, state["symbol"], state["price"])
 
                         self.stats["last_action"] = "Elite Engine Idle"
+                        cycle_ok = True
                     except Exception as e:
                         self.stats["last_action"] = f"Error: {str(e)[:40]}"
                         log.exception("Loop error")
@@ -568,7 +571,8 @@ class TradeXProClone:
                     
                     # Ensure dashboard updates even if logic fails
                     self.update_dashboard(layout, state)
-                    self.guard.record_success()
+                    if cycle_ok:
+                        self.guard.record_success()
                     dt = time.monotonic() - t0
                     await asyncio.sleep(max(0.5, 3 - dt))
         finally:

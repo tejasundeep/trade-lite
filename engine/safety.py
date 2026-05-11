@@ -84,7 +84,8 @@ class TradingCircuitBreaker:
                     age = self.streamer.market_age_seconds(symbol)
                     if age > self.config.max_stale_seconds:
                         stale_symbols.append((symbol, age))
-                except Exception:
+                except Exception as exc:
+                    log.debug("Market age check failed for %s: %s", symbol, exc)
                     stale_symbols.append((symbol, float("inf")))
             if stale_symbols:
                 label = ", ".join(f"{s}:{age:.1f}s" for s, age in stale_symbols[:3])

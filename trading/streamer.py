@@ -357,7 +357,10 @@ class BinanceStreamer:
                     retry_delay = min(retry_delay * 2, 60)
 
     async def _listen_user_data(self):
-        if not self.adapter or not getattr(self.adapter, "api_key", None) or not getattr(self.adapter, "secret", None):
+        if not self.adapter or getattr(self.adapter, "paper_trading", False):
+            log.info("Skipping user data stream because paper trading is enabled.")
+            return
+        if not getattr(self.adapter, "api_key", None) or not getattr(self.adapter, "secret", None):
             log.info("Skipping Spot user data stream because no API credentials are configured.")
             return
         if getattr(self.adapter, "trading_mode", "spot") == "futures":
