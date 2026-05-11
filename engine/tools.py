@@ -18,13 +18,14 @@ _SLIP_BPS  = 0.0005
 
 
 class TradingTools:
-    def __init__(self, api_key: str = None, secret: str = None, paper_trading: bool = True):
-        self.adapter      = CCXTCryptoAdapter(api_key=api_key, secret=secret, paper_trading=paper_trading)
+    def __init__(self, api_key: str = None, secret: str = None, paper_trading: bool = True, exchange_id: str = "binanceusdm"):
+        self.adapter      = CCXTCryptoAdapter(exchange_id=exchange_id, api_key=api_key, secret=secret, paper_trading=paper_trading)
         self._day_balance: Optional[float] = None
         self._snap_date:   Optional[date]  = None
 
     def get_market_data(self, symbol: str, timeframe: str = "1h", limit: int = 500) -> pd.DataFrame:
-        df = self.adapter.get_market_data(symbol, timeframe, limit)
+        m_symbol = self.adapter.get_market_symbol(symbol)
+        df = self.adapter.get_market_data(m_symbol, timeframe, limit)
         df["EMA_50"]  = df["close"].ewm(span=50,  adjust=False).mean()
         df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
         set_market_data(df)
@@ -33,7 +34,8 @@ class TradingTools:
     def get_institutional_levels(self, symbol: str) -> Dict:
         levels = {}
         try:
-            df_d = self.adapter.get_market_data(symbol, "1d", 5)
+            m_symbol = self.adapter.get_market_symbol(symbol)
+            df_d = self.adapter.get_market_data(m_symbol, "1d", 5)
             if not df_d.empty:
                 levels.update({
                     "pdh": float(df_d.iloc[-2]["high"]),
@@ -41,7 +43,7 @@ class TradingTools:
                     "pdo": float(df_d.iloc[-2]["open"]),
                     "pdc": float(df_d.iloc[-2]["close"]),
                 })
-            df_w = self.adapter.get_market_data(symbol, "1w", 3)
+            df_w = self.adapter.get_market_data(m_symbol, "1w", 3)
             if not df_w.empty:
                 levels.update({
                     "weekly_open": float(df_w.iloc[-1]["open"]),
@@ -52,14 +54,25 @@ class TradingTools:
         return levels
 
     def get_ticker(self, symbol: str) -> Dict:
-        return self.adapter.get_ticker(symbol)
+        m_symbol = self.adapter.get_market_symbol(symbol)
+        return self.adapter.get_ticker(m_symbol)
 
     def get_account_balance(self) -> Dict:
         return self.adapter.get_account_balance()
 
     def get_balance(self) -> float:
-        bal = self.adapter.get_account_balance()
-        return float(bal.get("free", {}).get("USDT", 0.0))
+        try:
+            bal = self.adapter.get_account_balance()
+            # Binance Spot users often hold FDUSD or USDC now
+            for asset in ["USDT", "FDUSD", "USDC", "BUSD"]:
+                free = float(bal.get("free", {}).get(asset, 0.0))
+                if free > 0.01:
+                    log.info(f"Found balance: {free:.2f} {asset}")
+                    return free
+            return 0.0
+        except Exception as e:
+            log.error(f"get_balance error: {e}")
+            return 0.0
 
     def _get_day_balance_snapshot(self) -> float:
         today = datetime.utcnow().date()
@@ -116,9 +129,10 @@ class TradingTools:
                     
                     if is_tp1:
                         log.info(f"TP1 for {pos.symbol}. Move to BE+ (fees coverage).")
+                        m_symbol = self.adapter.get_market_symbol(pos.symbol)
                         close_amt = pos.amount * 0.5
                         side = "sell" if pos.side == "long" else "buy"
-                        self.adapter.place_market_order(pos.symbol, side, close_amt)
+                        self.adapter.place_market_order(m_symbol, side, close_amt)
                         
                         # BE+ (entry + 15bps to cover slippage/fees)
                         be_plus = pos.avg_price * 1.0015 if pos.side == "long" else pos.avg_price * 0.9985
@@ -160,8 +174,9 @@ class TradingTools:
 
     def _execute_full_close(self, session, pos, price, reason):
         log.info(f"Exiting full position {pos.symbol} via {reason}")
+        m_symbol = self.adapter.get_market_symbol(pos.symbol)
         side = "sell" if pos.side == "long" else "buy"
-        self.adapter.place_market_order(pos.symbol, side, pos.amount)
+        self.adapter.place_market_order(m_symbol, side, pos.amount)
         fill_px = price * (1 - (_SLIP_BPS + _FEE_BPS)) if side == "sell" else price * (1 + (_SLIP_BPS + _FEE_BPS))
         pnl = (fill_px - pos.avg_price) * pos.amount * (1 if pos.side == "long" else -1)
         session.add(Trade(symbol=pos.symbol, side=side, price=fill_px, amount=pos.amount,
@@ -217,10 +232,11 @@ class TradingTools:
             if today_pnl <= -(day_balance * 0.05):
                 return {"error": "Daily loss limit reached. Trading suspended."}
 
+            m_symbol = self.adapter.get_market_symbol(symbol)
             pos = session.query(Position).filter_by(symbol=symbol).first()
             is_closing = pos and ((pos.side == "long" and side == "sell") or (pos.side == "short" and side == "buy"))
 
-            result = self.adapter.place_order_with_sl_tp(symbol, side, amount, price, stop_loss, take_profit)
+            result = self.adapter.place_order_with_sl_tp(m_symbol, side, amount, price, stop_loss, take_profit)
             fill_price = price * (1 + (_SLIP_BPS + _FEE_BPS)) if side == "buy" else price * (1 - (_SLIP_BPS + _FEE_BPS))
 
             realized_pnl = None

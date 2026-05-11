@@ -23,12 +23,14 @@ class TradingEngine:
         self.tools        = tools
         self.risk_manager = risk_manager
 
-    async def run(self, state: Dict, execute: bool = True, streamer = None) -> Dict:
+    async def run(self, state: Dict, execute: bool = True, streamer = None, df_override = None, htf_df_override = None) -> Dict:
         symbol = state["symbol"]
 
         # 1. RETRIEVE - Zero Latency Priority
-        # Use streamed candles if available, otherwise fallback to tools (REST)
-        if streamer:
+        if df_override is not None:
+            df = df_override
+            price = float(df.iloc[-1]["close"])
+        elif streamer:
             df = streamer.get_candles(symbol)
             if df.empty: df = self.tools.get_market_data(symbol)
             price = streamer.prices.get(symbol, 0.0)
@@ -57,9 +59,13 @@ class TradingEngine:
         
         # Only update HTF bias every 15 minutes or if missing
         import time
-        if htf_bias == "Neutral" or (time.time() - last_htf_update > 900):
+        if htf_bias == "Neutral" or (time.time() - last_htf_update > 900) or htf_df_override is not None:
             try:
-                df_htf = self.tools.get_market_data(symbol, timeframe="1h", limit=200)
+                if htf_df_override is not None:
+                    df_htf = htf_df_override
+                else:
+                    df_htf = self.tools.get_market_data(symbol, timeframe="1h", limit=200)
+                
                 set_market_data(df_htf)
                 htf_smc  = analyze_smc_structure()
                 htf_bias = htf_smc.get("structure", "Neutral")

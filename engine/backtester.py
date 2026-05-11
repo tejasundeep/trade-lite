@@ -121,8 +121,8 @@ class BacktestEngine:
                 # Inject frozen HTF data so engine never fetches live data during backtest
                 "_htf_df_override": htf_df,
             }
-            # Perfection Fix: execute=False prevents backtest from writing to live DB
-            state = await self.engine.run(state, execute=False)
+            # Perfection Fix: execute=False and overrides prevent backtest from live hits
+            state = await self.engine.run(state, execute=False, df_override=window, htf_df_override=htf_df)
             decision = state.get("decision", {})
             action   = decision.get("action", "hold")
 
