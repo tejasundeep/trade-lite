@@ -55,7 +55,7 @@ class CCXTCryptoAdapter:
         else:
             self.base_url = "https://api.binance.com"
             self.ws_url = "wss://stream.binance.com:9443/stream"
-            self.ws_user_data_url = "wss://ws-api.binance.com:443/ws-api/v3"
+            self.ws_user_data_url = "wss://ws-api.binance.com/ws-api/v3"
 
         self.recv_window = 5000
         self._paper_balance = float(os.getenv("PAPER_BALANCE", "10000"))
@@ -141,6 +141,18 @@ class CCXTCryptoAdapter:
                 return entry
         return None
 
+    def to_display_symbol(self, symbol: str) -> str:
+        m_symbol = self.get_market_symbol(symbol)
+        info = self._symbol_info(m_symbol)
+        if info:
+            base = info.get("baseAsset")
+            quote = info.get("quoteAsset")
+            if base and quote:
+                return f"{base}/{quote}"
+        if "/" in symbol:
+            return symbol.strip().upper()
+        return symbol.upper().strip()
+
     @staticmethod
     def _floor_to_step(value: float, step: str) -> str:
         d_value = Decimal(str(value))
@@ -151,6 +163,8 @@ class CCXTCryptoAdapter:
         return format(quantized.normalize(), "f")
 
     def amount_to_precision(self, symbol: str, amount: float) -> str:
+        if amount <= 0:
+            return "0"
         info = self._symbol_info(symbol)
         step = "0.000001"
         if info:
@@ -159,6 +173,15 @@ class CCXTCryptoAdapter:
                     step = f.get("stepSize", step)
                     break
         return self._floor_to_step(amount, step)
+
+    def _validate_order_quantity(self, symbol: str, amount: float) -> tuple[Optional[str], Optional[str]]:
+        quantity = self.amount_to_precision(symbol, amount)
+        try:
+            if Decimal(quantity) <= 0:
+                return None, "Order amount rounds to zero"
+        except Exception:
+            return None, "Unable to validate order amount"
+        return quantity, None
 
     def price_to_precision(self, symbol: str, price: float) -> str:
         info = self._symbol_info(symbol)
@@ -356,7 +379,7 @@ class CCXTCryptoAdapter:
             side = "long" if (position_side == "LONG" or position_amt > 0) else "short"
             positions.append(
                 {
-                    "symbol": market_symbol,
+                    "symbol": self.to_display_symbol(market_symbol),
                     "market_symbol": market_symbol,
                     "side": side,
                     "amount": abs(position_amt),
@@ -388,7 +411,9 @@ class CCXTCryptoAdapter:
         position_side: Optional[str] = None,
     ) -> Dict:
         m_symbol = self.get_market_symbol(symbol)
-        quantity = self.amount_to_precision(m_symbol, amount)
+        quantity, quantity_error = self._validate_order_quantity(m_symbol, amount)
+        if quantity_error:
+            return {"error": quantity_error, "symbol": m_symbol, "side": side.upper(), "type": "MARKET"}
 
         if self.paper_trading:
             return {
@@ -412,7 +437,7 @@ class CCXTCryptoAdapter:
                 "quantity": quantity,
                 "newOrderRespType": "RESULT",
             }
-            if reduce_only:
+            if reduce_only and self.position_mode != "HEDGE":
                 params["reduceOnly"] = "true"
             if self.position_mode == "HEDGE":
                 params["positionSide"] = (position_side or self._position_side_param(side) or "").upper()
@@ -436,9 +461,12 @@ class CCXTCryptoAdapter:
         side: str,
         amount: float,
         price: float,
+        position_side: Optional[str] = None,
     ) -> Dict:
         m_symbol = self.get_market_symbol(symbol)
-        quantity = self.amount_to_precision(m_symbol, amount)
+        quantity, quantity_error = self._validate_order_quantity(m_symbol, amount)
+        if quantity_error:
+            return {"error": quantity_error, "symbol": m_symbol, "side": side.upper(), "type": "LIMIT"}
         limit_price = self.price_to_precision(m_symbol, price)
 
         if self.paper_trading:
@@ -454,7 +482,7 @@ class CCXTCryptoAdapter:
             }
 
         if self.trading_mode == "futures":
-            return self.place_market_order(symbol, side, amount, reduce_only=False)
+            return self.place_market_order(symbol, side, amount, reduce_only=False, position_side=position_side)
 
         # Use market semantics for live spot entries so the local position state
         # remains aligned with the actual exchange fill. Limit entries can sit
@@ -529,11 +557,12 @@ class CCXTCryptoAdapter:
             "type": order_type,
             "quantity": quantity,
             "stopPrice": self.price_to_precision(symbol, trigger_price),
-            "reduceOnly": "true" if reduce_only else "false",
             "workingType": "MARK_PRICE",
             "priceProtect": "TRUE",
             "newOrderRespType": "RESULT",
         }
+        if self.position_mode != "HEDGE":
+            params["reduceOnly"] = "true" if reduce_only else "false"
         if self.position_mode == "HEDGE":
             params["positionSide"] = "LONG" if side.lower() == "sell" else "SHORT"
         return self._signed_request("POST", "/fapi/v1/order", params)
@@ -547,7 +576,9 @@ class CCXTCryptoAdapter:
         take_profit: float,
     ) -> Dict:
         m_symbol = self.get_market_symbol(symbol)
-        quantity = self.amount_to_precision(m_symbol, amount)
+        quantity, quantity_error = self._validate_order_quantity(m_symbol, amount)
+        if quantity_error:
+            return {"error": quantity_error, "symbol": m_symbol}
         exit_side = "sell" if position_side.lower() == "long" else "buy"
 
         if self.trading_mode == "futures":
@@ -572,9 +603,13 @@ class CCXTCryptoAdapter:
         price: float,
         stop_loss: float,
         take_profit: float,
+        attach_exit_orders: bool = True,
+        position_side: Optional[str] = None,
     ) -> Dict:
         try:
-            entry_order = self._place_entry_order(symbol, side, amount, price)
+            entry_order = self._place_entry_order(symbol, side, amount, price, position_side=position_side)
+            if entry_order.get("error"):
+                return {"entry": entry_order, "error": entry_order["error"]}
             executed_qty = Decimal(str(entry_order.get("executedQty", entry_order.get("origQty", "0")) or "0"))
             order_status = str(entry_order.get("status", "")).upper()
 
@@ -586,18 +621,53 @@ class CCXTCryptoAdapter:
 
             exit_side = "sell" if side.lower() == "buy" else "buy"
             if self.trading_mode == "futures":
-                position_side = "long" if side.lower() == "buy" else "short"
+                if not attach_exit_orders:
+                    return {
+                        "entry": entry_order,
+                        "strategy": "Futures market order",
+                        "position_side": (position_side or self._position_side_param(side) or "").lower(),
+                    }
+
+                exit_position_side = "long" if side.lower() == "buy" else "short"
                 try:
-                    exit_orders = self.place_exit_orders(symbol, position_side, float(executed_qty), stop_loss, take_profit)
+                    exit_orders = self.place_exit_orders(symbol, exit_position_side, float(executed_qty), stop_loss, take_profit)
                 except Exception as exc:
                     log.warning("Failed to place protective exits for %s: %s", symbol, exc)
                     exit_orders = {"error": str(exc)}
+
+                exit_error = exit_orders.get("error")
+                if exit_error and not self.paper_trading:
+                    try:
+                        self.cancel_all_open_orders(symbol)
+                    except Exception as exc:
+                        log.warning("Failed to cancel open orders during protective unwind for %s: %s", symbol, exc)
+                    unwind_side = "sell" if side.lower() == "buy" else "buy"
+                    try:
+                        unwind = self.place_market_order(
+                            symbol,
+                            unwind_side,
+                            float(executed_qty),
+                            reduce_only=True,
+                            position_side=("LONG" if side.lower() == "buy" else "SHORT"),
+                        )
+                    except Exception as exc:
+                        unwind = {"error": str(exc)}
+                    return {
+                        "entry": entry_order,
+                        "sl": exit_orders.get("sl"),
+                        "tp": exit_orders.get("tp"),
+                        "strategy": "Futures entry + protective exits",
+                        "position_side": exit_position_side,
+                        "exit_error": exit_error,
+                        "unwind_result": unwind,
+                        "error": f"Protective exits failed; position auto-unwind attempted: {exit_error}",
+                    }
                 return {
                     "entry": entry_order,
                     "sl": exit_orders.get("sl"),
                     "tp": exit_orders.get("tp"),
                     "strategy": "Futures entry + protective exits",
-                    "position_side": position_side,
+                    "position_side": exit_position_side,
                     "exit_error": exit_orders.get("error"),
                 }
 
@@ -677,7 +747,7 @@ class CCXTCryptoAdapter:
                 {
                     "id": int(trade.get("id", trade.get("tradeId", 0)) or 0),
                     "orderId": int(trade.get("orderId", 0) or 0),
-                    "symbol": trade.get("symbol", self.get_market_symbol(symbol)),
+                    "symbol": self.to_display_symbol(trade.get("symbol", symbol)),
                     "side": str(side_value).upper(),
                     "qty": float(trade.get("qty", trade.get("q", 0.0)) or 0.0),
                     "price": float(trade.get("price", trade.get("p", 0.0)) or 0.0),

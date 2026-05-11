@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import logging
 import pandas as pd
 from typing import Dict, List, Optional, Any
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 import json
 import time
 
@@ -17,6 +17,10 @@ log = logging.getLogger(__name__)
 _FEE_BPS   = 0.001
 _SLIP_BPS  = 0.0005
 _EXECUTION_STATE_KEY = "execution_reconciliation_state"
+
+
+def _utc_today():
+    return datetime.now(timezone.utc).date()
 
 
 class TradingTools:
@@ -146,6 +150,9 @@ class TradingTools:
             return "created"
 
         if local:
+            # Only delete a local position when the exchange snapshot is trusted.
+            if remote is None:
+                return "preserved"
             session.delete(local)
             return "deleted"
 
@@ -187,12 +194,30 @@ class TradingTools:
             state = self._load_json_state(_EXECUTION_STATE_KEY, {})
             target_symbols = list(dict.fromkeys(symbols or []))
             if not target_symbols:
-                target_symbols = [p["symbol"] for p in self.adapter.get_open_positions()]
+                try:
+                    target_symbols = [p["symbol"] for p in self.adapter.get_open_positions()]
+                except Exception as exc:
+                    log.warning("Could not seed target symbols from remote positions: %s", exc)
+                    target_symbols = []
 
-            remote_positions = {p["market_symbol"]: p for p in self.adapter.get_open_positions()}
+            remote_positions = {}
+            positions_snapshot_ok = False
+            try:
+                remote_snapshot = self.adapter.get_open_positions()
+                remote_positions = {
+                    p["market_symbol"]: p
+                    for p in remote_snapshot
+                    if isinstance(p, dict) and p.get("market_symbol")
+                }
+                positions_snapshot_ok = True
+            except Exception as exc:
+                log.warning("Could not fetch remote positions: %s", exc)
+
             if target_symbols:
                 allowed = {self.adapter.get_market_symbol(s) for s in target_symbols}
                 remote_positions = {ms: pos for ms, pos in remote_positions.items() if ms in allowed}
+            elif not positions_snapshot_ok:
+                target_symbols = [pos.symbol for pos in session.query(Position).all()]
 
             for symbol in target_symbols or [self.adapter.get_market_symbol(ms) for ms in remote_positions.keys()]:
                 market_symbol = self.adapter.get_market_symbol(symbol)
@@ -214,6 +239,20 @@ class TradingTools:
 
                 stop_loss, take_profit = self._current_exit_order_prices(symbol)
                 remote = remote_positions.get(market_symbol)
+                if not positions_snapshot_ok and remote is None:
+                    action = self._sync_local_position_snapshot(session, symbol, remote, stop_loss=stop_loss, take_profit=take_profit)
+                    summary["symbols"].append(
+                        {
+                            "symbol": symbol,
+                            "market_symbol": market_symbol,
+                            "fills_seen": len(new_fills),
+                            "position_action": action,
+                            "remote_position": False,
+                            "last_trade_id": cursor_state.get("last_trade_id", 0),
+                            "snapshot_ok": False,
+                        }
+                    )
+                    continue
                 action = self._sync_local_position_snapshot(session, symbol, remote, stop_loss=stop_loss, take_profit=take_profit)
                 summary["symbols"].append(
                     {
@@ -223,6 +262,7 @@ class TradingTools:
                         "position_action": action,
                         "remote_position": bool(remote and remote.get("amount", 0.0) > 0),
                         "last_trade_id": cursor_state.get("last_trade_id", 0),
+                        "snapshot_ok": positions_snapshot_ok,
                     }
                 )
 
@@ -297,7 +337,7 @@ class TradingTools:
             return 0.0
 
     def _get_day_balance_snapshot(self) -> float:
-        today = datetime.utcnow().date()
+        today = _utc_today()
         if self._snap_date == today and self._day_balance is not None:
             return self._day_balance
         session = get_session()
@@ -365,7 +405,13 @@ class TradingTools:
                         m_symbol = self.adapter.get_market_symbol(pos.symbol)
                         close_amt = pos.amount * 0.5
                         side = "sell" if pos.side == "long" else "buy"
-                        result = self.adapter.place_market_order(m_symbol, side, close_amt, reduce_only=True)
+                        result = self.adapter.place_market_order(
+                            m_symbol,
+                            side,
+                            close_amt,
+                            reduce_only=True,
+                            position_side=pos.side.upper(),
+                        )
                         if result.get("error"):
                             log.warning("TP1 partial close failed for %s: %s", pos.symbol, result.get("error"))
                             continue
@@ -428,7 +474,13 @@ class TradingTools:
         m_symbol = self.adapter.get_market_symbol(pos.symbol)
         side = "sell" if pos.side == "long" else "buy"
         original_amount = pos.amount
-        result = self.adapter.place_market_order(m_symbol, side, pos.amount, reduce_only=True)
+        result = self.adapter.place_market_order(
+            m_symbol,
+            side,
+            pos.amount,
+            reduce_only=True,
+            position_side=pos.side.upper(),
+        )
         if result.get("error"):
             log.warning("Full close failed for %s: %s", pos.symbol, result.get("error"))
             return False
@@ -477,7 +529,7 @@ class TradingTools:
     def get_todays_realized_pnl(self) -> float:
         session = get_session()
         try:
-            today = datetime.utcnow().date()
+            today = _utc_today()
             trades = session.query(Trade).filter(Trade.pnl.isnot(None)).all()
             return sum(t.pnl or 0.0 for t in trades if t.timestamp.date() == today)
         finally: session.close()
@@ -504,7 +556,18 @@ class TradingTools:
             pos = session.query(Position).filter_by(symbol=symbol).first()
             is_closing = pos and ((pos.side == "long" and side == "sell") or (pos.side == "short" and side == "buy"))
 
-            result = self.adapter.place_order_with_sl_tp(m_symbol, side, amount, price, stop_loss, take_profit)
+            attach_exit_orders = not bool(is_closing)
+            position_side = pos.side.upper() if is_closing and pos else None
+            result = self.adapter.place_order_with_sl_tp(
+                m_symbol,
+                side,
+                amount,
+                price,
+                stop_loss,
+                take_profit,
+                attach_exit_orders=attach_exit_orders,
+                position_side=position_side,
+            )
             if result.get("error"):
                 session.rollback()
                 return result

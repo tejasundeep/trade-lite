@@ -79,17 +79,29 @@ class TradingCircuitBreaker:
 
         if self.streamer is not None:
             stale_symbols = []
+            toxic_spreads = []
             for symbol in symbols:
                 try:
                     age = self.streamer.market_age_seconds(symbol)
                     if age > self.config.max_stale_seconds:
                         stale_symbols.append((symbol, age))
+
+                    spread = float(getattr(self.streamer, "get_spread", lambda _s: 0.0)(symbol) or 0.0)
+                    price = float(getattr(self.streamer, "prices", {}).get(symbol, 0.0) or 0.0)
+                    if spread > 0 and price > 0:
+                        spread_bps = (spread / price) * 10000.0
+                        if spread_bps > self.config.max_spread_bps:
+                            toxic_spreads.append((symbol, spread_bps))
                 except Exception as exc:
                     log.debug("Market age check failed for %s: %s", symbol, exc)
                     stale_symbols.append((symbol, float("inf")))
             if stale_symbols:
                 label = ", ".join(f"{s}:{age:.1f}s" for s, age in stale_symbols[:3])
                 self.trip(f"stale_market_data:{label}")
+                return {"allowed": False, "reason": self.trip_reason, "tripped": True}
+            if toxic_spreads:
+                label = ", ".join(f"{s}:{bps:.1f}bps" for s, bps in toxic_spreads[:3])
+                self.trip(f"toxic_spread:{label}")
                 return {"allowed": False, "reason": self.trip_reason, "tripped": True}
 
         return {"allowed": True, "reason": "ok", "tripped": False}

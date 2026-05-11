@@ -7,7 +7,7 @@ import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
@@ -21,7 +21,7 @@ from engine.engine import TradingEngine
 from engine.backtester import BacktestEngine
 from engine.safety import TradingCircuitBreaker, TradingSafetyConfig, StrategyValidationGate
 from trading.risk import MarketRiskManager, MarketRiskConfig
-from db import init_db
+from db import init_db, get_session, Position
 
 from trading.streamer import BinanceStreamer
 
@@ -36,6 +36,46 @@ logging.basicConfig(
     handlers=[logging.FileHandler("bot.log"), RichHandler(rich_tracebacks=True)],
 )
 log = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() == "true"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning("Invalid integer for %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning("Invalid float for %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _normalize_symbols(symbols: list[str], primary: str) -> list[str]:
+    ordered = [s.strip() for s in symbols if s and s.strip()]
+    if primary and primary not in ordered:
+        ordered.insert(0, primary)
+    return list(dict.fromkeys(ordered))
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class _HealthRequestHandler(BaseHTTPRequestHandler):
@@ -76,41 +116,42 @@ class TradeXProClone:
         key = os.getenv("BINANCE_API_KEY", "").strip()
         log.info(f"Initializing with API Key: {key[:4]}...{key[-4:] if len(key)>4 else ''}")
         trading_mode = os.getenv("TRADING_MODE", "futures").strip().lower()
-        leverage = int(os.getenv("FUTURES_LEVERAGE", "3"))
+        leverage = _env_int("FUTURES_LEVERAGE", 3)
         margin_type = os.getenv("MARGIN_TYPE", "ISOLATED").strip().upper()
         position_mode = os.getenv("POSITION_MODE", "ONE_WAY").strip().upper()
         
         self.tools = TradingTools(
             api_key=key,
             secret=os.getenv("BINANCE_SECRET", "").strip(),
-            paper_trading=os.getenv("PAPER_TRADING", "true").lower() == "true",
+            paper_trading=_env_bool("PAPER_TRADING", True),
             exchange_id=os.getenv("EXCHANGE_ID", "binance").strip(),
             trading_mode=trading_mode,
             leverage=leverage,
             margin_type=margin_type,
             position_mode=position_mode,
-            max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05")),
+            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 0.05),
         )
         self.risk = MarketRiskManager(MarketRiskConfig(
-            max_risk_per_trade_pct=float(os.getenv("MAX_RISK_PER_TRADE_PCT", 0.015)),
-            max_position_pct=float(os.getenv("MAX_POSITION_PCT", 0.15)),
-            min_order_quote=float(os.getenv("MIN_ORDER_QUOTE", 10.0)),
-            max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", 0.05)),
-            cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", 45))
+            max_risk_per_trade_pct=_env_float("MAX_RISK_PER_TRADE_PCT", 0.015),
+            max_position_pct=_env_float("MAX_POSITION_PCT", 0.15),
+            min_order_quote=_env_float("MIN_ORDER_QUOTE", 10.0),
+            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 0.05),
+            cooldown_minutes=_env_int("COOLDOWN_MINUTES", 45)
         ))
         self.engine = TradingEngine(self.tools, self.risk)
         self.backtester = BacktestEngine(self.engine, self.tools)
-        self.symbol = os.getenv("SYMBOL", "BTC/USDT")
-        self.symbols = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
-        self.paper_replay = os.getenv("PAPER_REPLAY", "false").lower() == "true"
-        self.paper_replay_limit = int(os.getenv("PAPER_REPLAY_LIMIT", "1000"))
-        self.paper_replay_alert_confidence = float(os.getenv("PAPER_REPLAY_ALERT_CONFIDENCE", "0.75"))
-        self.paper_replay_max_drawdown_pct = float(os.getenv("PAPER_REPLAY_MAX_DRAWDOWN_PCT", "12.0"))
-        self.reconcile_interval_seconds = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
+        self.symbol = os.getenv("SYMBOL", "BTC/USDT").strip() or "BTC/USDT"
+        configured_symbols = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
+        self.symbols = _normalize_symbols(configured_symbols, self.symbol)
+        self.paper_replay = _env_bool("PAPER_REPLAY", False)
+        self.paper_replay_limit = _env_int("PAPER_REPLAY_LIMIT", 1000)
+        self.paper_replay_alert_confidence = _env_float("PAPER_REPLAY_ALERT_CONFIDENCE", 0.75)
+        self.paper_replay_max_drawdown_pct = _env_float("PAPER_REPLAY_MAX_DRAWDOWN_PCT", 12.0)
+        self.reconcile_interval_seconds = _env_int("RECONCILE_INTERVAL_SECONDS", 60)
         self.last_reconcile_at = 0.0
-        self.health_api_enabled = os.getenv("HEALTH_API_ENABLED", "true").lower() == "true"
+        self.health_api_enabled = _env_bool("HEALTH_API_ENABLED", True)
         self.health_api_host = os.getenv("HEALTH_API_HOST", "0.0.0.0").strip()
-        self.health_api_port = int(os.getenv("HEALTH_API_PORT", "8080"))
+        self.health_api_port = _env_int("HEALTH_API_PORT", 8080)
         self._health_api_server = None
         self._health_api_thread = None
         self.streamer = BinanceStreamer(self.symbols, adapter=self.tools.adapter)
@@ -126,12 +167,12 @@ class TradeXProClone:
 
         self.guard = TradingCircuitBreaker(
             TradingSafetyConfig(
-                max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", "3")),
-                error_cooldown_minutes=int(os.getenv("ERROR_COOLDOWN_MINUTES", "30")),
-                max_daily_drawdown_pct=float(os.getenv("MAX_LIVE_DRAWDOWN_PCT", "3.0")),
-                max_stale_seconds=int(os.getenv("MAX_STALE_SECONDS", "20")),
-                max_spread_bps=float(os.getenv("MAX_ALLOWED_SPREAD_BPS", "15.0")),
-                min_live_balance=float(os.getenv("MIN_LIVE_BALANCE", "0.0")),
+                max_consecutive_errors=_env_int("MAX_CONSECUTIVE_ERRORS", 3),
+                error_cooldown_minutes=_env_int("ERROR_COOLDOWN_MINUTES", 30),
+                max_daily_drawdown_pct=_env_float("MAX_LIVE_DRAWDOWN_PCT", 3.0),
+                max_stale_seconds=_env_int("MAX_STALE_SECONDS", 20),
+                max_spread_bps=_env_float("MAX_ALLOWED_SPREAD_BPS", 15.0),
+                min_live_balance=_env_float("MIN_LIVE_BALANCE", 0.0),
             ),
             streamer=self.streamer,
             tools=self.tools,
@@ -140,14 +181,14 @@ class TradeXProClone:
             backtester=self.backtester,
             symbols=self.symbols,
             timeframe=os.getenv("TIMEFRAME", "5m"),
-            limit=int(os.getenv("VALIDATION_LIMIT", "400")),
-            train_size=int(os.getenv("VALIDATION_TRAIN_SIZE", "120")),
-            test_size=int(os.getenv("VALIDATION_TEST_SIZE", "60")),
-            step_size=int(os.getenv("VALIDATION_STEP_SIZE", "60")),
+            limit=_env_int("VALIDATION_LIMIT", 400),
+            train_size=_env_int("VALIDATION_TRAIN_SIZE", 120),
+            test_size=_env_int("VALIDATION_TEST_SIZE", 60),
+            step_size=_env_int("VALIDATION_STEP_SIZE", 60),
             min_walk_forward_verdict=os.getenv("VALIDATION_MIN_VERDICT", "promote_to_paper_candidate"),
-            max_risk_of_ruin_pct=float(os.getenv("VALIDATION_MAX_ROR_PCT", "5.0")),
-            max_drawdown_pct=float(os.getenv("VALIDATION_MAX_DRAWDOWN_PCT", "20.0")),
-            min_profit_factor=float(os.getenv("VALIDATION_MIN_PROFIT_FACTOR", "1.05")),
+            max_risk_of_ruin_pct=_env_float("VALIDATION_MAX_ROR_PCT", 5.0),
+            max_drawdown_pct=_env_float("VALIDATION_MAX_DRAWDOWN_PCT", 20.0),
+            min_profit_factor=_env_float("VALIDATION_MIN_PROFIT_FACTOR", 1.05),
         )
         
         self._trade_lock = asyncio.Lock()
@@ -162,7 +203,7 @@ class TradeXProClone:
                     log.warning("Futures symbol bootstrap skipped for %s: %s", symbol, e)
 
     async def _bootstrap_validation(self):
-        require_validation = os.getenv("REQUIRE_VALIDATION_ON_STARTUP", "true").lower() == "true"
+        require_validation = _env_bool("REQUIRE_VALIDATION_ON_STARTUP", True)
         if self.tools.adapter.paper_trading or not require_validation:
             self.live_enabled = True
             return
@@ -177,6 +218,22 @@ class TradeXProClone:
         else:
             log.info("Startup validation passed. Live trading armed.")
 
+    async def _startup_reconcile(self):
+        if self.tools.adapter.paper_trading:
+            return
+        try:
+            report = await asyncio.to_thread(self.tools.reconcile_execution_state, self.symbols)
+            self.last_reconcile_at = time.time()
+            self.stats["last_action"] = f"Startup reconciled {len(report.get('symbols', []))} symbols"
+            log.info(
+                "Startup reconciliation complete | reconciled=%s cursor_updated=%s symbols=%d",
+                report.get("reconciled", False),
+                report.get("cursor_updated", False),
+                len(report.get("symbols", [])),
+            )
+        except Exception as exc:
+            log.warning("Startup reconciliation failed: %s", exc)
+
     def get_status_snapshot(self) -> Dict:
         adapter = getattr(self.tools, "adapter", None)
         open_positions = []
@@ -187,7 +244,7 @@ class TradeXProClone:
 
         return {
             "service": "trade-lite",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": _utc_now().isoformat(),
             "mode": os.getenv("BOT_MODE", "live"),
             "trading_mode": getattr(adapter, "trading_mode", "unknown"),
             "paper_trading": getattr(adapter, "paper_trading", False),
@@ -209,7 +266,12 @@ class TradeXProClone:
         if not self.health_api_enabled or self._health_api_server is not None:
             return
 
-        server = ThreadingHTTPServer((self.health_api_host, self.health_api_port), _HealthRequestHandler)
+        try:
+            server = ThreadingHTTPServer((self.health_api_host, self.health_api_port), _HealthRequestHandler)
+        except OSError as exc:
+            log.warning("Health API disabled; could not bind %s:%s: %s", self.health_api_host, self.health_api_port, exc)
+            self.health_api_enabled = False
+            return
         server.bot = self
         self._health_api_server = server
         thread = threading.Thread(target=server.serve_forever, daemon=True, name="health-api")
@@ -254,14 +316,14 @@ class TradeXProClone:
 
         self.validation_report["paper_replay"] = {
             "symbols": reports,
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": _utc_now().isoformat(),
         }
         log.info("Paper replay complete for %d symbol(s).", len(reports))
 
     async def _run_backtest_mode(self, symbols: Optional[list[str]] = None, timeframe: Optional[str] = None, limit: Optional[int] = None):
         test_symbols = symbols or self.symbols
         test_timeframe = timeframe or os.getenv("TIMEFRAME", "5m")
-        test_limit = limit or int(os.getenv("BACKTEST_LIMIT", os.getenv("VALIDATION_LIMIT", "400")))
+        test_limit = limit or _env_int("BACKTEST_LIMIT", _env_int("VALIDATION_LIMIT", 400))
         self.stats["last_action"] = "Running backtest suite..."
 
         reports = []
@@ -298,7 +360,7 @@ class TradeXProClone:
 
         summary = {
             "mode": "backtest",
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": _utc_now().isoformat(),
             "symbols": reports,
         }
         self.validation_report["backtest"] = summary
@@ -348,7 +410,7 @@ class TradeXProClone:
         execution_mode = os.getenv("TRADING_MODE", "futures").upper()
         mode = "[bold red]LIVE[/]" if os.getenv("PAPER_TRADING", "true").lower() == "false" else "[bold yellow]PAPER[/]"
 
-        layout["header"].update(Panel(f"[bold cyan]TradeX Pro 2.0 (Elite)[/] | [white]{state.get('symbol')}[/] | {execution_mode} {mode} | [dim]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/] | Cycle #{self.stats['cycles']}", style="blue"))
+        layout["header"].update(Panel(f"[bold cyan]TradeX Pro 2.0 (Elite)[/] | [white]{state.get('symbol')}[/] | {execution_mode} {mode} | [dim]{_utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}[/] | Cycle #{self.stats['cycles']}", style="blue"))
         
         mkt = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
         mkt.add_column("", style="dim"); mkt.add_column("", style="bold")
@@ -415,13 +477,58 @@ class TradeXProClone:
         """Handle real-time balance and order updates from WebSocket."""
         event = update.get("event")
         if event in ["outboundAccountPosition", "balanceUpdate", "externalLockUpdate", "ACCOUNT_UPDATE"]:
+            balance_updated = False
             for b in update.get("balances", []):
-                if b["asset"] == "USDT":
-                    self.cached_balance = b["free"]
+                asset = b.get("asset")
+                free = b.get("free")
+                if asset == "USDT" and free is not None:
+                    self.cached_balance = float(free)
                     self.last_balance_update = time.time()
+                    balance_updated = True
                     log.info(f"Real-time Balance Update: {self.cached_balance} USDT")
-            if event == "balanceUpdate" and "balances" not in update:
+            if not balance_updated and event == "balanceUpdate" and "balances" not in update:
                 self.last_balance_update = 0
+
+            if update.get("positions"):
+                session = get_session()
+                try:
+                    for pos in update.get("positions", []):
+                        symbol = pos.get("symbol")
+                        if not symbol:
+                            continue
+                        amount = float(pos.get("amount", 0.0) or 0.0)
+                        existing = session.query(Position).filter_by(symbol=symbol).first()
+                        if amount <= 0:
+                            if existing:
+                                session.delete(existing)
+                            continue
+
+                        side = str(pos.get("side", "long") or "long").lower()
+                        stop_loss = float(existing.stop_loss if existing else 0.0)
+                        take_profit = float(existing.take_profit if existing else 0.0)
+                        if existing:
+                            existing.amount = amount
+                            existing.side = side
+                            existing.avg_price = float(pos.get("entry_price", existing.avg_price) or existing.avg_price)
+                            existing.updated_at = _utc_now()
+                        else:
+                            session.add(
+                                Position(
+                                    symbol=symbol,
+                                    avg_price=float(pos.get("entry_price", 0.0) or 0.0),
+                                    amount=amount,
+                                    side=side,
+                                    stop_loss=stop_loss,
+                                    take_profit=take_profit,
+                                    tp1_hit=False,
+                                )
+                            )
+                    session.commit()
+                except Exception as exc:
+                    session.rollback()
+                    log.warning("Real-time position sync failed: %s", exc)
+                finally:
+                    session.close()
         elif event in ["executionReport", "ORDER_TRADE_UPDATE"]:
             order = update.get("order", {})
             log.info(
@@ -478,6 +585,8 @@ class TradeXProClone:
             self.last_balance_update = time.time()
         except Exception as e:
             log.warning("Initial balance sync failed: %s", e)
+
+        await self._startup_reconcile()
 
         try:
             with Live(layout, refresh_per_second=4, screen=False):

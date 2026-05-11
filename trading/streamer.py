@@ -75,8 +75,16 @@ class BinanceStreamer:
             curr["volume"] += volume
             curr["trades"] += 1
 
+    def _display_symbol(self, symbol: str) -> str:
+        if self.adapter and hasattr(self.adapter, "to_display_symbol"):
+            try:
+                return self.adapter.to_display_symbol(symbol)
+            except Exception:
+                pass
+        return self.symbol_map.get(str(symbol).lower().replace("/", ""), symbol)
+
     async def _handle_trade(self, symbol_ws: str, data: dict):
-        orig_symbol = self.symbol_map.get(symbol_ws)
+        orig_symbol = self._display_symbol(self.symbol_map.get(symbol_ws, symbol_ws))
         if not orig_symbol:
             return
 
@@ -109,7 +117,7 @@ class BinanceStreamer:
                 log.error("Callback error: %s", e)
 
     async def _handle_book_ticker(self, symbol_ws: str, data: dict):
-        orig_symbol = self.symbol_map.get(symbol_ws)
+        orig_symbol = self._display_symbol(self.symbol_map.get(symbol_ws, symbol_ws))
         if not orig_symbol:
             return
 
@@ -151,16 +159,45 @@ class BinanceStreamer:
                 for b in event.get("B", [])
             ]
         elif event_type == "ACCOUNT_UPDATE":
+            account_update = event.get("a", {}) if isinstance(event.get("a"), dict) else {}
             balances = []
-            for b in event.get("a", {}).get("B", []):
+            for b in account_update.get("B", []):
                 balances.append(
                     {
                         "asset": b.get("a"),
                         "free": float(b.get("wb", 0.0)),
+                        "cross_wallet": float(b.get("cw", 0.0)),
+                        "balance_change": float(b.get("bc", 0.0)),
                         "locked": 0.0,
                     }
                 )
             update["balances"] = balances
+            positions = []
+            for p in account_update.get("P", []):
+                try:
+                    amount = float(p.get("pa", 0.0) or 0.0)
+                except Exception:
+                    amount = 0.0
+                if abs(amount) <= 1e-12:
+                    continue
+                position_side = str(p.get("ps", "BOTH") or "BOTH").upper()
+                side = "long" if (position_side == "LONG" or amount > 0) else "short"
+                symbol_value = p.get("s")
+                positions.append(
+                    {
+                        "symbol": self._display_symbol(symbol_value),
+                        "market_symbol": symbol_value,
+                        "side": side,
+                        "amount": abs(amount),
+                        "entry_price": float(p.get("ep", 0.0) or 0.0),
+                        "breakeven_price": float(p.get("bep", 0.0) or 0.0),
+                        "unrealized_pnl": float(p.get("up", 0.0) or 0.0),
+                        "margin_type": str(p.get("mt", "") or ""),
+                        "position_side": position_side,
+                        "isolation_wallet": float(p.get("iw", 0.0) or 0.0),
+                    }
+                )
+            update["positions"] = positions
         elif event_type == "balanceUpdate":
             update["balance_update"] = {
                 "asset": event.get("a"),
@@ -169,7 +206,7 @@ class BinanceStreamer:
             }
         elif event_type == "executionReport":
             update["order"] = {
-                "symbol": self.symbol_map.get(event.get("s", "").lower(), event.get("s")),
+                "symbol": self._display_symbol(event.get("s", "")),
                 "side": event.get("S", "").lower(),
                 "status": event.get("X"),
                 "type": event.get("o"),
@@ -183,7 +220,7 @@ class BinanceStreamer:
         elif event_type == "ORDER_TRADE_UPDATE":
             order = event.get("o", {})
             update["order"] = {
-                "symbol": self.symbol_map.get(order.get("s", "").lower(), order.get("s")),
+                "symbol": self._display_symbol(order.get("s", "")),
                 "side": order.get("S", "").lower(),
                 "status": order.get("X"),
                 "type": order.get("o"),
@@ -221,7 +258,7 @@ class BinanceStreamer:
                 log.error("Account callback error: %s", e)
 
     async def _listen_spot_user_data(self):
-        url = getattr(self.adapter, "ws_api_url", "wss://ws-api.binance.com:443/ws-api/v3")
+        url = getattr(self.adapter, "ws_user_data_url", "wss://ws-api.binance.com/ws-api/v3")
         retry_delay = 1
 
         while not self._stop_event.is_set():

@@ -1,7 +1,11 @@
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Index, Boolean
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
 
 Base = declarative_base()
 
@@ -15,7 +19,7 @@ class Trade(Base):
     pnl       = Column(Float)
     status    = Column(String)
     reason    = Column(String)
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime(timezone=True), default=utcnow, index=True)
 
 class Position(Base):
     __tablename__ = "positions"
@@ -28,7 +32,7 @@ class Position(Base):
     take_profit = Column(Float)
     tp1_hit     = Column(Boolean, default=False)
     trailing_stop_price = Column(Float, nullable=True) 
-    updated_at  = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at  = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 class SystemState(Base):
     __tablename__ = "system_state"
