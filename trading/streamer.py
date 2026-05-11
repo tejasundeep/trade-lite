@@ -41,6 +41,7 @@ class BinanceStreamer:
         self._stop_event = asyncio.Event()
         self._callbacks: List[Callable] = []
         self._account_callbacks: List[Callable] = []
+        self._tasks: List[asyncio.Task] = []
 
     def add_callback(self, cb: Callable):
         self._callbacks.append(cb)
@@ -245,7 +246,10 @@ class BinanceStreamer:
                     await ws.send(json.dumps(subscribe_payload))
 
                     while not self._stop_event.is_set():
-                        msg = await ws.recv()
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        except asyncio.TimeoutError:
+                            continue
                         data = json.loads(msg)
 
                         if data.get("id") == "user-data-subscribe":
@@ -293,7 +297,10 @@ class BinanceStreamer:
                     retry_delay = 1
 
                     while not self._stop_event.is_set():
-                        msg = await ws.recv()
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        except asyncio.TimeoutError:
+                            continue
                         data = json.loads(msg)
                         if data.get("e") in {"ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"}:
                             await self._dispatch_account_update(data)
@@ -326,7 +333,10 @@ class BinanceStreamer:
                     retry_delay = 1
 
                     while not self._stop_event.is_set():
-                        msg = await ws.recv()
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        except asyncio.TimeoutError:
+                            continue
                         data = json.loads(msg)
                         stream = data.get("stream", "")
                         payload = data.get("data", {})
@@ -356,11 +366,18 @@ class BinanceStreamer:
             await self._listen_spot_user_data()
 
     def start(self):
-        asyncio.create_task(self._listen_market())
-        asyncio.create_task(self._listen_user_data())
+        if self._tasks:
+            return
+        self._tasks = [
+            asyncio.create_task(self._listen_market()),
+            asyncio.create_task(self._listen_user_data()),
+        ]
 
     def stop(self):
         self._stop_event.set()
+        for task in self._tasks:
+            task.cancel()
+        self._tasks.clear()
 
     def get_candles(self, symbol: str) -> pd.DataFrame:
         history = list(self.candles.get(symbol, []))

@@ -138,7 +138,9 @@ class StrategyValidationGate:
                 mc = await self.backtester.run_monte_carlo(symbol, self.timeframe, limit=self.limit, iterations=400)
 
                 verdict = wf.get("verdict", "reject_or_rework")
-                profit_factor = float(wf.get("edge_quality", {}).get("profit_factor", 0.0) or 0.0)
+                profit_factor = float(
+                    wf.get("edge_quality", {}).get("profit_factor", wf.get("profit_factor", 0.0)) or 0.0
+                )
                 worst_dd = float(mc.get("worst_max_drawdown_pct", 100.0) or 100.0)
                 risk_of_ruin = float(mc.get("risk_of_ruin_pct", 100.0) or 100.0)
 

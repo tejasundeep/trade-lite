@@ -1,5 +1,6 @@
 import asyncio
 import time
+import copy
 import requests
 from .market_context import is_backtest
 
@@ -14,7 +15,7 @@ _DEFAULT = {
 
 def _fetch_sync() -> dict:
     """Runs in a thread pool — keeps event loop unblocked."""
-    result = dict(_DEFAULT)
+    result = copy.deepcopy(_DEFAULT)
     try:
         r = requests.get("https://api.alternative.me/fng/", timeout=4)
         if r.status_code == 200:

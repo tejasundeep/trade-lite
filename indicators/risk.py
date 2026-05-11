@@ -38,10 +38,24 @@ def calculate_risk_parameters(
     historical_win_rate: float = 0.55,
     total_trades: int = 0,
     is_last_trade_loss: bool = False,
-    spread_bps: float = 5.0 # Spread in basis points
+    spread_bps: float = 5.0, # Spread in basis points
+    max_risk_per_trade_pct: float = 0.015,
+    max_position_pct: float = 0.15,
+    min_order_quote: float = 10.0,
 ) -> Dict:
     state = _get_state()
     now   = time.time()
+
+    if free_balance <= 0 or current_price <= 0:
+        return {
+            "action": "lock",
+            "reason": "Invalid balance or price",
+            "recommended_amount": 0.0,
+            "risk_pct": 0.0,
+            "notional_value": 0.0,
+            "sl_distance_pct": 0,
+            "liquidity_penalty": False,
+        }
 
     if is_last_trade_loss:
         state["consecutive_losses"] += 1
@@ -58,11 +72,11 @@ def calculate_risk_parameters(
 
     # 1. Base Kelly / Flat %
     if total_trades < 30:
-        final_risk_pct = 0.005
+        final_risk_pct = min(0.005, max_risk_per_trade_pct)
     else:
         full_kelly     = (historical_win_rate * expected_r - (1 - historical_win_rate)) / expected_r
         safe_kelly     = max(0.0, full_kelly * 0.20)
-        final_risk_pct = min(safe_kelly * confidence_score, 0.02)
+        final_risk_pct = min(safe_kelly * confidence_score, max_risk_per_trade_pct)
 
     # 2. Elite Liquidity Adjustment
     # If spread > 10% of the ATR, we are in a low-liquidity environment. Reduce risk.
@@ -83,12 +97,24 @@ def calculate_risk_parameters(
         sl_dist      = abs(current_price - stop_loss)
         asset_amount = risk_amount / sl_dist if sl_dist > 0 else 0.0
         notional     = asset_amount * current_price
-        if notional > free_balance:
-            asset_amount = free_balance / current_price
-            notional     = free_balance
+        max_notional  = free_balance * max_position_pct
+        if notional > max_notional:
+            asset_amount = max_notional / current_price
+            notional     = max_notional
     else:
         asset_amount = (free_balance * final_risk_pct) / current_price
         notional     = asset_amount * current_price
+
+    if notional < min_order_quote:
+        return {
+            "action": "lock",
+            "reason": f"Below minimum order quote: {notional:.2f} < {min_order_quote:.2f}",
+            "recommended_amount": round(asset_amount, 6),
+            "risk_pct": round(final_risk_pct * 100, 2),
+            "notional_value": round(notional, 2),
+            "sl_distance_pct": round(abs(current_price - (stop_loss or 0)) / current_price * 100, 2) if stop_loss else 0,
+            "liquidity_penalty": liquidity_penalty < 1.0,
+        }
 
     return {
         "action":           "trade",

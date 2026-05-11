@@ -1,28 +1,31 @@
+import pandas as pd
 import numpy as np
 from .market_context import get_market_data
 
 def calculate_vwap_analysis() -> dict:
     raw = get_market_data()
-    if raw is None or raw.empty or len(raw) < 20:
+    window = 24
+    if raw is None or raw.empty or len(raw) < window:
         return {"error": "Insufficient data"}
     
     df = raw.copy()
-    window = 24
     
     typical_price = (df['high'] + df['low'] + df['close']) / 3
     tp_vol = typical_price * df['volume']
     
-    rolling_tp_vol = tp_vol.rolling(window=window).sum()
-    rolling_vol = df['volume'].rolling(window=window).sum()
+    rolling_tp_vol = tp_vol.rolling(window=window, min_periods=window).sum()
+    rolling_vol = df['volume'].rolling(window=window, min_periods=window).sum()
     
     vwap = rolling_tp_vol / rolling_vol
     
-    var = ((typical_price - vwap)**2).rolling(window=window).mean()
-    vwap_std = np.sqrt(var)
+    vwap_std = typical_price.rolling(window=window, min_periods=window).std()
     
     latest_px   = df['close'].iloc[-1]
     latest_vwap = vwap.iloc[-1]
     latest_std  = vwap_std.iloc[-1]
+
+    if pd.isna(latest_vwap) or pd.isna(latest_std):
+        return {"error": "Insufficient rolling window data"}
     
     # Epsilon protection for zero-volatility environments
     denominator = latest_std if latest_std > 1e-9 else 1e-9

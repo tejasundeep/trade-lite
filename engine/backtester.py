@@ -3,8 +3,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
+import json
+import time
 from typing import Dict, Any, List, Optional
-from indicators.market_context import set_market_data, get_market_data
+from indicators.market_context import set_market_data, get_market_data, set_backtest, is_backtest
+from db import get_session, SystemState
 
 class BacktestEngine:
     """
@@ -41,21 +44,17 @@ class BacktestEngine:
 
     # ─── Public Entry Points ──────────────────────────────────────────────────
     async def run(self, symbol: str, timeframe: str, limit: int = 200) -> Dict:
-        df     = self.tools.get_market_data(symbol, timeframe, limit + 50)
-        htf_df = self.tools.get_market_data(symbol, "1d", 60)  # pre-fetch once, frozen
-        return await self._run_on_dataframe(symbol, timeframe, df, htf_df)
+        df = self.tools.get_market_data(symbol, timeframe, limit + 50)
+        return await self._run_on_dataframe(symbol, timeframe, df)
 
     async def run_walk_forward(self, symbol: str, timeframe: str, limit: int = 300,
                                train_size: int = 120, test_size: int = 60, step_size: int = 60) -> Dict:
         df     = self.tools.get_market_data(symbol, timeframe, limit + 50)
-        htf_df = self.tools.get_market_data(symbol, "1d", 60)
         segments, start, seg_id = [], max(train_size, 50), 1
         while start + test_size <= len(df):
             seg_df = df.iloc[max(0, start - 50): start + test_size].copy()
-            # Slice HTF to the same historical window — no future data
-            htf_slice = htf_df.iloc[:max(1, start // (len(df) // max(len(htf_df), 1)))].copy() if not htf_df.empty else htf_df
             if len(seg_df) >= 55:
-                res = await self._run_on_dataframe(symbol, timeframe, seg_df, htf_slice)
+                res = await self._run_on_dataframe(symbol, timeframe, seg_df)
                 segments.append({
                     "id": seg_id, "metrics": res["edge_quality"],
                     "total_trades": res["total_trades"], "wins": res["wins"], "losses": res["losses"],
@@ -98,44 +97,198 @@ class BacktestEngine:
             "baseline_metrics": baseline.get("edge_quality", {}),
         }
 
+    async def run_paper_replay(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 500,
+        alert_confidence_threshold: float = 0.75,
+        max_drawdown_pct: float = 12.0,
+        stop_on_safety_trip: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Replay a historical market stream in paper mode using the same signal
+        and execution path as live trading, while collecting alerts and safety
+        trip reports.
+        """
+        df = self.tools.get_market_data(symbol, timeframe, limit + 100)
+        if df is None or df.empty or len(df) < 120:
+            return {"symbol": symbol, "timeframe": timeframe, "error": "Insufficient data for replay"}
+
+        prev_backtest = is_backtest()
+        trades: List[Dict[str, Any]] = []
+        alerts: List[Dict[str, Any]] = []
+        safety_events: List[Dict[str, Any]] = []
+        equity_curve: List[float] = []
+        peak_equity = self.starting_equity
+        consecutive_losses = 0
+        safety_tripped = False
+
+        try:
+            set_backtest(True)
+            self.virtual_portfolio = self._fresh_portfolio()
+
+            for i in range(100, len(df)):
+                window = df.iloc[i - 100: i + 1].copy()
+                set_market_data(window)
+
+                price = float(window.iloc[-1]["close"])
+                high = float(window.iloc[-1]["high"])
+                low = float(window.iloc[-1]["low"])
+                ts = window.iloc[-1]["timestamp"]
+
+                self._mark_open_trade_excursion(high, low)
+                self._simulate_stop(ts, low, high, trades, price)
+
+                htf_levels, htf_bias = self._historical_htf_context(df, i)
+                state = {
+                    "symbol": symbol,
+                    "price": price,
+                    "balance": self.virtual_portfolio["free_usdt"],
+                    "plan": {},
+                    "indicators": {},
+                    "htf_levels": htf_levels,
+                }
+                state = await self.engine.run(
+                    state,
+                    execute=False,
+                    df_override=window,
+                    htf_levels_override=htf_levels,
+                    htf_bias_override=htf_bias,
+                )
+                decision = state.get("decision", {})
+                if decision.get("action") == "trade" and float(decision.get("confidence", 0.0) or 0.0) >= alert_confidence_threshold:
+                    alerts.append(
+                        {
+                            "timestamp": str(ts),
+                            "symbol": symbol,
+                            "side": decision.get("side"),
+                            "strategy": decision.get("strategy"),
+                            "confidence": decision.get("confidence", 0.0),
+                            "expected_r": decision.get("expected_r", 0.0),
+                            "reason": decision.get("reason", ""),
+                            "price": price,
+                        }
+                    )
+
+                pre_trade_count = len(trades)
+                action = str(decision.get("action", "hold")).lower()
+                trade_side = str(decision.get("trade_side") or decision.get("side") or action).lower()
+                if trade_side not in {"buy", "sell"}:
+                    trade_side = None
+                if trade_side in {"buy", "sell"}:
+                    self._open_or_close(trade_side, decision, price, high, low, ts, trades)
+
+                if len(trades) > pre_trade_count:
+                    last_trade = trades[-1]
+                    pnl = float(last_trade.get("pnl", 0.0) or 0.0)
+                    if pnl < 0:
+                        consecutive_losses += 1
+                    elif pnl > 0:
+                        consecutive_losses = 0
+
+                total_equity = self.virtual_portfolio["free_usdt"] + (self.virtual_portfolio["position"] * price)
+                equity_curve.append(total_equity)
+                peak_equity = max(peak_equity, total_equity)
+                drawdown_pct = ((peak_equity - total_equity) / peak_equity) * 100 if peak_equity > 0 else 0.0
+
+                if drawdown_pct >= max_drawdown_pct:
+                    safety_tripped = True
+                    safety_events.append(
+                        {
+                            "timestamp": str(ts),
+                            "type": "max_drawdown",
+                            "drawdown_pct": drawdown_pct,
+                            "limit_pct": max_drawdown_pct,
+                            "equity": total_equity,
+                        }
+                    )
+                    if stop_on_safety_trip:
+                        break
+
+                if consecutive_losses >= 3:
+                    safety_tripped = True
+                    safety_events.append(
+                        {
+                            "timestamp": str(ts),
+                            "type": "loss_streak",
+                            "streak": consecutive_losses,
+                            "equity": total_equity,
+                        }
+                    )
+                    if stop_on_safety_trip:
+                        break
+
+            metrics = self._calculate_metrics(equity_curve, trades)
+            report = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "mode": "paper_replay",
+                "alerts": alerts,
+                "safety_events": safety_events,
+                "safety_tripped": safety_tripped,
+                "trades": trades,
+                "equity_curve_points": len(equity_curve),
+                "metrics": metrics,
+            }
+            self._persist_report("paper_replay_report", report)
+            return report
+        finally:
+            set_backtest(prev_backtest)
+
     # ─── Core Simulation ─────────────────────────────────────────────────────
     async def _run_on_dataframe(self, symbol: str, timeframe: str, df: pd.DataFrame,
                                 htf_df: pd.DataFrame = None) -> Dict:
         self.virtual_portfolio = self._fresh_portfolio()
         trades, equity_curve = [], []
 
-        for i in range(100, len(df)):
-            window = df.iloc[i - 100: i + 1]
-            set_market_data(window)
-            price = float(window.iloc[-1]["close"])
-            high  = float(window.iloc[-1]["high"])
-            low   = float(window.iloc[-1]["low"])
-            ts    = window.iloc[-1]["timestamp"]
+        prev_backtest = is_backtest()
+        try:
+            set_backtest(True)
 
-            self._mark_open_trade_excursion(high, low)
-            self._simulate_stop(ts, low, high, trades, price)
+            for i in range(100, len(df)):
+                window = df.iloc[i - 100: i + 1]
+                set_market_data(window)
+                price = float(window.iloc[-1]["close"])
+                high  = float(window.iloc[-1]["high"])
+                low   = float(window.iloc[-1]["low"])
+                ts    = window.iloc[-1]["timestamp"]
 
-            state = {
-                "symbol": symbol, "price": price, "balance": self.virtual_portfolio["free_usdt"],
-                "plan": {}, "indicators": {},
-                # Inject frozen HTF data so engine never fetches live data during backtest
-                "_htf_df_override": htf_df,
-            }
-            # Perfection Fix: execute=False and overrides prevent backtest from live hits
-            state = await self.engine.run(state, execute=False, df_override=window, htf_df_override=htf_df)
-            decision = state.get("decision", {})
-            action   = decision.get("action", "hold")
+                self._mark_open_trade_excursion(high, low)
+                self._simulate_stop(ts, low, high, trades, price)
 
-            if action == "buy":
-                self._open_or_close("buy", decision, price, high, low, ts, trades)
-            elif action == "sell":
-                self._open_or_close("sell", decision, price, high, low, ts, trades)
+                htf_levels, htf_bias = self._historical_htf_context(df, i)
+                state = {
+                    "symbol": symbol,
+                    "price": price,
+                    "balance": self.virtual_portfolio["free_usdt"],
+                    "plan": {},
+                    "indicators": {},
+                    "htf_levels": htf_levels,
+                }
+                state = await self.engine.run(
+                    state,
+                    execute=False,
+                    df_override=window,
+                    htf_levels_override=htf_levels,
+                    htf_bias_override=htf_bias,
+                )
+                decision = state.get("decision", {})
+                action = str(decision.get("action", "hold")).lower()
+                trade_side = str(decision.get("trade_side") or decision.get("side") or action).lower()
+                if trade_side not in {"buy", "sell"}:
+                    trade_side = None
 
-            total_equity = self.virtual_portfolio["free_usdt"] + (self.virtual_portfolio["position"] * price)
-            equity_curve.append(total_equity)
-            self.virtual_portfolio["bars_total"] += 1
-            if self.virtual_portfolio["position"] > 0:
-                self.virtual_portfolio["bars_in_position"] += 1
+                if trade_side in {"buy", "sell"}:
+                    self._open_or_close(trade_side, decision, price, high, low, ts, trades)
+
+                total_equity = self.virtual_portfolio["free_usdt"] + (self.virtual_portfolio["position"] * price)
+                equity_curve.append(total_equity)
+                self.virtual_portfolio["bars_total"] += 1
+                if self.virtual_portfolio["position"] > 0:
+                    self.virtual_portfolio["bars_in_position"] += 1
+        finally:
+            set_backtest(prev_backtest)
 
         metrics = self._calculate_metrics(equity_curve, trades)
         closed_trades = [t for t in trades if t.get("pnl") is not None]
@@ -150,6 +303,73 @@ class BacktestEngine:
             "fees_paid": self.virtual_portfolio["fees_paid"],
             "edge_quality": metrics, "trades": trades,
         }
+
+    def _historical_htf_context(self, df: pd.DataFrame, index: int) -> tuple[Dict, str]:
+        # Use only historical data available up to the current bar and rebuild
+        # higher-timeframe structure from the lower-timeframe source.
+        history = df.iloc[: index + 1].copy()
+        if history.empty:
+            return {}, "Neutral"
+
+        daily_window = self._resample_ohlcv(history, "1D")
+        weekly_window = self._resample_ohlcv(history, "1W-MON")
+        levels = self.tools.build_institutional_levels(daily_window, weekly_window)
+
+        bias = "Neutral"
+        hourly_window = self._resample_ohlcv(history, "1h")
+        if len(hourly_window) >= 50:
+            try:
+                from indicators.smc import analyze_smc_structure
+
+                bias = analyze_smc_structure(df_override=hourly_window).get("structure", "Neutral")
+            except Exception:
+                pass
+        if bias == "Neutral" and levels.get("weekly_open"):
+            price = float(history.iloc[-1]["close"])
+            weekly_open = levels.get("weekly_open")
+            dist_pct = (price - weekly_open) / weekly_open
+            if dist_pct > 0.002:
+                bias = "Bullish"
+            elif dist_pct < -0.002:
+                bias = "Bearish"
+        return levels, bias
+
+    def _resample_ohlcv(self, source: pd.DataFrame, rule: str) -> pd.DataFrame:
+        if source is None or source.empty:
+            return pd.DataFrame()
+        frame = source.copy()
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+        frame = frame.sort_values("timestamp").set_index("timestamp")
+        aggregated = frame.resample(rule, label="left", closed="left").agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        aggregated = aggregated.dropna(subset=["open", "high", "low", "close"])
+        if aggregated.empty:
+            return pd.DataFrame()
+        aggregated = aggregated.reset_index()
+        return aggregated
+
+    def _persist_report(self, key: str, payload: Dict[str, Any]):
+        session = get_session()
+        try:
+            row = session.query(SystemState).filter_by(key=key).first()
+            value = json.dumps(payload, default=str)
+            if row:
+                row.value = value
+            else:
+                session.add(SystemState(key=key, value=value))
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            log.warning("Could not persist %s: %s", key, e)
+        finally:
+            session.close()
 
     def _open_or_close(self, action: str, decision: Dict, price: float,
                        high: float, low: float, ts, trades: list):
@@ -253,7 +473,11 @@ class BacktestEngine:
 
     def _buy_price(self, price: float, amount: float = 0.0) -> float:
         df = get_market_data()
-        atr = df["close"].diff().abs().rolling(14).mean().iloc[-1] if df is not None else price * 0.001
+        atr = price * 0.001
+        if df is not None and not df.empty and "close" in df.columns:
+            atr_val = df["close"].diff().abs().rolling(14, min_periods=1).mean().iloc[-1]
+            if pd.notna(atr_val) and atr_val > 0:
+                atr = float(atr_val)
         vol_mult = max(1.0, atr / (price * 0.005))
         stochastic = abs(np.random.normal(0, self.slippage_pct * 0.5))
         impact = (amount * price / self.market_depth_usdt) * 0.01
@@ -261,7 +485,11 @@ class BacktestEngine:
 
     def _sell_price(self, price: float, amount: float = 0.0) -> float:
         df = get_market_data()
-        atr = df["close"].diff().abs().rolling(14).mean().iloc[-1] if df is not None else price * 0.001
+        atr = price * 0.001
+        if df is not None and not df.empty and "close" in df.columns:
+            atr_val = df["close"].diff().abs().rolling(14, min_periods=1).mean().iloc[-1]
+            if pd.notna(atr_val) and atr_val > 0:
+                atr = float(atr_val)
         vol_mult = max(1.0, atr / (price * 0.005))
         stochastic = abs(np.random.normal(0, self.slippage_pct * 0.5))
         impact = (amount * price / self.market_depth_usdt) * 0.01
@@ -331,15 +559,22 @@ class BacktestEngine:
         for t in trades:
             if t.get("pnl") is None: continue
             grouped.setdefault(t.get("strategy") or "unknown", []).append(t)
-        return {
-            s: {
-                "strategy": s, "trades": len(items),
-                "wins": len([t for t in items if (t.get("pnl") or 0) > 0]),
-                "total_pnl": sum(float(t.get("pnl", 0.0) or 0.0) for t in items),
-                "avg_r_multiple": float(np.mean([float(t.get("r_multiple", 0.0) or 0.0) for t in items])) if items else 0.0,
+        strategy_scores = {}
+        for s, items in grouped.items():
+            pnls = [float(t.get("pnl", 0.0) or 0.0) for t in items]
+            r_vals = [float(t.get("r_multiple", 0.0) or 0.0) for t in items]
+            wins = len([p for p in pnls if p > 0])
+            total_pnl = sum(pnls)
+            avg_r = float(np.mean(r_vals)) if r_vals else 0.0
+            strategy_scores[s] = {
+                "strategy": s,
+                "trades": len(items),
+                "wins": wins,
+                "total_pnl": total_pnl,
+                "avg_r_multiple": avg_r,
+                "score_sum": (total_pnl * 0.01) + (avg_r * 5.0) + (wins / max(len(items), 1)) * 2.5,
             }
-            for s, items in grouped.items()
-        }
+        return strategy_scores
 
     def _score_walk_forward(self, symbol: str, timeframe: str, segments: list) -> Dict:
         returns = [float(s["metrics"].get("total_return_pct", 0.0)) for s in segments]
@@ -357,6 +592,12 @@ class BacktestEngine:
         return {"symbol": symbol, "timeframe": timeframe, "mode": "walk_forward",
                 "segments": segments, "pass_rate_pct": pass_rate, "avg_return_pct": avg_ret,
                 "avg_r_multiple": float(np.mean(avg_rs)) if avg_rs else 0.0,
+                "edge_quality": {
+                    "profit_factor": float(np.mean(pfs)) if pfs else 0.0,
+                    "max_drawdown_pct": abs(min(dds, default=0.0)),
+                    "avg_return_pct": avg_ret,
+                    "avg_r_multiple": float(np.mean(avg_rs)) if avg_rs else 0.0,
+                },
                 "robust_score": robust_score, "verdict": verdict}
 
     def _rank_strategy_tournament(self, segments: list) -> list:
@@ -368,6 +609,7 @@ class BacktestEngine:
                                           "positive_segments": 0})
                 item["segments"] += 1; item["trades"] += score["trades"]; item["wins"] += score["wins"]
                 item["total_pnl"] += score["total_pnl"]; item["avg_r_sum"] += score["avg_r_multiple"]
+                item["score_sum"] += score.get("score_sum", 0.0)
                 if score["total_pnl"] > 0: item["positive_segments"] += 1
         ranked = []
         for s, item in agg.items():

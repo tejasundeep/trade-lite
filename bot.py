@@ -1,7 +1,11 @@
 import os
 import asyncio
+import argparse
+import json
 import logging
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Dict
 from datetime import datetime
 from dotenv import load_dotenv
@@ -33,6 +37,40 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+class _HealthRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        bot = getattr(self.server, "bot", None)
+        if self.path not in {"/health", "/status"}:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
+            return
+
+        payload = bot.get_status_snapshot() if bot else {"ok": False, "error": "bot_unavailable"}
+        if self.path == "/health":
+            response = {
+                "ok": True,
+                "service": payload.get("service", "trade-lite"),
+                "mode": payload.get("mode", "unknown"),
+                "timestamp": payload.get("timestamp"),
+                "alive": True,
+            }
+        else:
+            response = payload
+
+        data = json.dumps(response, default=str).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format, *args):
+        return
+
+
 class TradeXProClone:
     def __init__(self):
         key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -54,6 +92,8 @@ class TradeXProClone:
         )
         self.risk = MarketRiskManager(MarketRiskConfig(
             max_risk_per_trade_pct=float(os.getenv("MAX_RISK_PER_TRADE_PCT", 0.015)),
+            max_position_pct=float(os.getenv("MAX_POSITION_PCT", 0.15)),
+            min_order_quote=float(os.getenv("MIN_ORDER_QUOTE", 10.0)),
             max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", 0.05)),
             cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", 45))
         ))
@@ -61,6 +101,17 @@ class TradeXProClone:
         self.backtester = BacktestEngine(self.engine, self.tools)
         self.symbol = os.getenv("SYMBOL", "BTC/USDT")
         self.symbols = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
+        self.paper_replay = os.getenv("PAPER_REPLAY", "false").lower() == "true"
+        self.paper_replay_limit = int(os.getenv("PAPER_REPLAY_LIMIT", "1000"))
+        self.paper_replay_alert_confidence = float(os.getenv("PAPER_REPLAY_ALERT_CONFIDENCE", "0.75"))
+        self.paper_replay_max_drawdown_pct = float(os.getenv("PAPER_REPLAY_MAX_DRAWDOWN_PCT", "12.0"))
+        self.reconcile_interval_seconds = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
+        self.last_reconcile_at = 0.0
+        self.health_api_enabled = os.getenv("HEALTH_API_ENABLED", "true").lower() == "true"
+        self.health_api_host = os.getenv("HEALTH_API_HOST", "0.0.0.0").strip()
+        self.health_api_port = int(os.getenv("HEALTH_API_PORT", "8080"))
+        self._health_api_server = None
+        self._health_api_thread = None
         self.streamer = BinanceStreamer(self.symbols, adapter=self.tools.adapter)
         self.streamer.add_account_callback(self._handle_account_update)
         self.stats = {"cycles": 0, "last_action": "Initializing..."}
@@ -125,6 +176,148 @@ class TradeXProClone:
         else:
             log.info("Startup validation passed. Live trading armed.")
 
+    def get_status_snapshot(self) -> Dict:
+        adapter = getattr(self.tools, "adapter", None)
+        open_positions = []
+        for symbol in self.symbols:
+            pos = self._safe_tool_call("get_open_position", None, symbol)
+            if pos:
+                open_positions.append(pos)
+
+        return {
+            "service": "trade-lite",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "mode": os.getenv("BOT_MODE", "live"),
+            "trading_mode": getattr(adapter, "trading_mode", "unknown"),
+            "paper_trading": getattr(adapter, "paper_trading", False),
+            "paper_replay": getattr(self, "paper_replay", False),
+            "live_enabled": getattr(self, "live_enabled", False),
+            "guard_tripped": getattr(self, "guard", None).tripped if getattr(self, "guard", None) else False,
+            "guard_reason": getattr(self, "guard", None).trip_reason if getattr(self, "guard", None) else "",
+            "cycles": self.stats.get("cycles", 0),
+            "last_action": self.stats.get("last_action", ""),
+            "balance": getattr(self, "cached_balance", 0.0),
+            "last_balance_update": getattr(self, "last_balance_update", 0.0),
+            "symbols": self.symbols,
+            "open_positions_count": len(open_positions),
+            "open_positions": open_positions,
+            "validation_allowed": bool(self.validation_report.get("allowed", True)) if self.validation_report else None,
+        }
+
+    def start_health_api(self):
+        if not self.health_api_enabled or self._health_api_server is not None:
+            return
+
+        server = ThreadingHTTPServer((self.health_api_host, self.health_api_port), _HealthRequestHandler)
+        server.bot = self
+        self._health_api_server = server
+        thread = threading.Thread(target=server.serve_forever, daemon=True, name="health-api")
+        thread.start()
+        self._health_api_thread = thread
+        log.info("Health API listening on http://%s:%s", self.health_api_host, self.health_api_port)
+
+    def stop_health_api(self):
+        if self._health_api_server is None:
+            return
+        try:
+            self._health_api_server.shutdown()
+            self._health_api_server.server_close()
+        finally:
+            self._health_api_server = None
+            self._health_api_thread = None
+
+    async def _run_paper_replay_mode(self):
+        replay_symbols = [s.strip() for s in os.getenv("PAPER_REPLAY_SYMBOLS", "").split(",") if s.strip()] or [self.symbol]
+        replay_timeframe = os.getenv("TIMEFRAME", "5m")
+        self.stats["last_action"] = "Running paper replay..."
+        reports = []
+        for symbol in replay_symbols:
+            report = await self.backtester.run_paper_replay(
+                symbol=symbol,
+                timeframe=replay_timeframe,
+                limit=self.paper_replay_limit,
+                alert_confidence_threshold=self.paper_replay_alert_confidence,
+                max_drawdown_pct=self.paper_replay_max_drawdown_pct,
+            )
+            reports.append(report)
+            metrics = report.get("metrics", {})
+            log.info(
+                "Paper replay %s | equity=%.2f return=%.2f%% max_dd=%.2f%% alerts=%s trips=%s",
+                symbol,
+                metrics.get("final_equity", 0.0),
+                metrics.get("total_return_pct", 0.0),
+                metrics.get("max_drawdown_pct", 0.0),
+                len(report.get("alerts", [])),
+                len(report.get("safety_events", [])),
+            )
+
+        self.validation_report["paper_replay"] = {
+            "symbols": reports,
+            "generated_at": datetime.now().isoformat(),
+        }
+        log.info("Paper replay complete for %d symbol(s).", len(reports))
+
+    async def _run_backtest_mode(self, symbols: Optional[list[str]] = None, timeframe: Optional[str] = None, limit: Optional[int] = None):
+        test_symbols = symbols or self.symbols
+        test_timeframe = timeframe or os.getenv("TIMEFRAME", "5m")
+        test_limit = limit or int(os.getenv("BACKTEST_LIMIT", os.getenv("VALIDATION_LIMIT", "400")))
+        self.stats["last_action"] = "Running backtest suite..."
+
+        reports = []
+        for symbol in test_symbols:
+            walk_forward = await self.backtester.run_walk_forward(
+                symbol=symbol,
+                timeframe=test_timeframe,
+                limit=test_limit,
+                train_size=int(os.getenv("VALIDATION_TRAIN_SIZE", "120")),
+                test_size=int(os.getenv("VALIDATION_TEST_SIZE", "60")),
+                step_size=int(os.getenv("VALIDATION_STEP_SIZE", "60")),
+            )
+            monte_carlo = await self.backtester.run_monte_carlo(
+                symbol=symbol,
+                timeframe=test_timeframe,
+                limit=test_limit,
+                iterations=int(os.getenv("BACKTEST_MONTE_CARLO_ITERATIONS", "400")),
+            )
+            report = {
+                "symbol": symbol,
+                "timeframe": test_timeframe,
+                "walk_forward": walk_forward,
+                "monte_carlo": monte_carlo,
+            }
+            reports.append(report)
+            log.info(
+                "Backtest %s | verdict=%s robust=%.2f ror=%.2f%% worst_dd=%.2f%%",
+                symbol,
+                walk_forward.get("verdict", "n/a"),
+                float(walk_forward.get("robust_score", 0.0) or 0.0),
+                float(monte_carlo.get("risk_of_ruin_pct", 0.0) or 0.0),
+                float(monte_carlo.get("worst_max_drawdown_pct", 0.0) or 0.0),
+            )
+
+        summary = {
+            "mode": "backtest",
+            "generated_at": datetime.now().isoformat(),
+            "symbols": reports,
+        }
+        self.validation_report["backtest"] = summary
+
+        from db import get_session, SystemState
+        session = get_session()
+        try:
+            row = session.query(SystemState).filter_by(key="backtest_report").first()
+            payload = json.dumps(summary, default=str)
+            if row:
+                row.value = payload
+            else:
+                session.add(SystemState(key="backtest_report", value=payload))
+            session.commit()
+        finally:
+            session.close()
+
+        print(json.dumps(summary, indent=2, default=str))
+        return summary
+
     def create_layout(self) -> Layout:
         l = Layout()
         l.split_column(Layout(name="header", size=3), Layout(name="row1", size=12), Layout(name="row2", size=12), Layout(name="footer", size=3))
@@ -136,6 +329,16 @@ class TradeXProClone:
         if val > 0: return f"[{'green' if positive_good else 'red'}]{val:+.2f}[/]"
         if val < 0: return f"[{'red' if positive_good else 'green'}]{val:+.2f}[/]"
         return f"[dim]{val:.2f}[/]"
+
+    def _safe_tool_call(self, name: str, default=None, *args, **kwargs):
+        fn = getattr(self.tools, name, None)
+        if not callable(fn):
+            return default
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            log.debug("%s failed: %s", name, exc)
+            return default
 
     def update_dashboard(self, layout: Layout, state: dict):
         inds, plan, htf = state.get("indicators", {}), state.get("plan", {}), state.get("htf_levels", {})
@@ -227,8 +430,10 @@ class TradeXProClone:
                 order.get("status", "N/A"),
                 order.get("price", "N/A"),
             )
-            # In a full production system, we'd sync the local DB state here.
-            # For now, we log it and let the next cycle pick up changes if any.
+            try:
+                await asyncio.to_thread(self.tools.reconcile_execution_state, self.symbols)
+            except Exception as exc:
+                log.warning("Realtime reconciliation failed: %s", exc)
 
     async def scan_symbol(self, symbol: str, balance: float) -> Optional[dict]:
         try:
@@ -254,8 +459,15 @@ class TradeXProClone:
         atr_map = {}
         # Initial state to avoid NameError if loop fails early
         state = {"symbol": self.symbol, "balance": 0.0, "price": 0.0, "indicators": {}, "plan": {}, "htf_levels": {}, "decision": {}, "position": None, "recent_trades": [], "performance": {}, "today_pnl": 0.0, "unrealized_pnl": 0.0}
+
+        if self.paper_replay:
+            self.start_health_api()
+            await self._run_paper_replay_mode()
+            self.stop_health_api()
+            return
         
         await self._bootstrap_validation()
+        self.start_health_api()
         self.streamer.start()
         log.info("Elite Streamer Started. Warming up local candle buffers...")
         await asyncio.sleep(10)
@@ -266,94 +478,131 @@ class TradeXProClone:
         except Exception as e:
             log.warning("Initial balance sync failed: %s", e)
 
-        with Live(layout, refresh_per_second=4, screen=False):
-            while True:
-                t0 = time.monotonic()
-                try:
-                    self.stats["cycles"] += 1
-                    
-                    # 1. Real-time Balance is handled via callbacks. 
-                    # We only poll as a fallback if the stream hasn't updated in 5 minutes.
-                    if time.time() - self.last_balance_update > 300:
-                        try:
-                            self.cached_balance = self.tools.get_balance()
-                            self.last_balance_update = time.time()
-                            log.info(f"Balance updated via REST: {self.cached_balance} USDT")
-                            log.debug("Fallback Balance Fetch")
-                        except Exception as e:
-                            log.warning(f"Balance fetch failed: {e}")
-                    
-                    balance = self.cached_balance
-                    price_map = self.streamer.prices
+        try:
+            with Live(layout, refresh_per_second=4, screen=False):
+                while True:
+                    t0 = time.monotonic()
+                    try:
+                        self.stats["cycles"] += 1
+                        # 1. Real-time Balance is handled via callbacks.
+                        # We only poll as a fallback if the stream hasn't updated in 5 minutes.
+                        if time.time() - self.last_balance_update > 300:
+                            try:
+                                self.cached_balance = self.tools.get_balance()
+                                self.last_balance_update = time.time()
+                                log.info(f"Balance updated via REST: {self.cached_balance} USDT")
+                                log.debug("Fallback Balance Fetch")
+                            except Exception as e:
+                                log.warning(f"Balance fetch failed: {e}")
 
-                    day_balance = self.tools.get_day_balance_snapshot()
-                    safety = self.guard.evaluate(self.symbols, balance, day_balance)
-                    can_trade = self.live_enabled and safety.get("allowed", True)
-                    if not can_trade:
-                        self.stats["last_action"] = f"Trading paused: {safety.get('reason', 'disabled')}"
+                        balance = self.cached_balance
+                        price_map = self.streamer.prices
 
-                    if can_trade:
-                        # 2. Position Management
-                        async with self._trade_lock:
-                            self.stats["last_action"] = "Managing positions & Trail..."
-                            self.tools.sync_positions_from_exchange(self.symbols)
-                            # Safe extraction of SMC indicators
-                            smc_map = {s: self.symbol_states.get(s, {}).get("indicators", {}).get("smc", {}) for s in self.symbols}
-                            self.tools.manage_open_positions(price_map, atr_map, smc_map)
-                            
-                        # 3. Scanning Symbols
-                        self.stats["last_action"] = f"Scanning {len(self.symbols)} symbols..."
-                        results = await asyncio.gather(*[self.scan_symbol(s, balance) for s in self.symbols])
-                        candidates = self._correlation_ok([r for r in results if r is not None])
+                        day_balance = self.tools.get_day_balance_snapshot()
+                        safety = self.guard.evaluate(self.symbols, balance, day_balance)
+                        can_trade = self.live_enabled and safety.get("allowed", True)
+                        if not can_trade:
+                            self.stats["last_action"] = f"Trading paused: {safety.get('reason', 'disabled')}"
 
-                        # Update ATR Map
-                        for r in results:
-                            if r: atr_map[r["symbol"]] = r["indicators"].get("vol", {}).get("atr", 0)
-
-                        # 4. Execution Logic
-                        state = self.symbol_states.get(self.symbol, state)
-                        if candidates:
-                            best = max(candidates, key=lambda r: r["decision"]["confidence"] * r["decision"]["expected_r"])
+                        if can_trade:
+                            # 2. Position Management
                             async with self._trade_lock:
-                                self.stats["last_action"] = f"Executing trade on {best['symbol']}..."
-                                final_res = await self.engine.run(best, execute=True, streamer=self.streamer)
-                                self.symbol_states[best['symbol']] = final_res
-                                state = final_res
+                                self.stats["last_action"] = "Managing positions & Trail..."
+                                now = time.time()
+                                if now - self.last_reconcile_at >= self.reconcile_interval_seconds:
+                                    reconcile_report = self.tools.reconcile_execution_state(self.symbols)
+                                    self.last_reconcile_at = now
+                                    self.stats["last_action"] = f"Reconciled {len(reconcile_report.get('symbols', []))} symbols"
+                                # Safe extraction of SMC indicators
+                                smc_map = {s: self.symbol_states.get(s, {}).get("indicators", {}).get("smc", {}) for s in self.symbols}
+                                self.tools.manage_open_positions(price_map, atr_map, smc_map)
+
+                            # 3. Scanning Symbols
+                            self.stats["last_action"] = f"Scanning {len(self.symbols)} symbols..."
+                            results = await asyncio.gather(*[self.scan_symbol(s, balance) for s in self.symbols])
+                            candidates = self._correlation_ok([r for r in results if r is not None])
+
+                            # Update ATR Map
+                            for r in results:
+                                if r:
+                                    atr_map[r["symbol"]] = r["indicators"].get("vol", {}).get("atr", 0)
+
+                            # 4. Execution Logic
+                            state = self.symbol_states.get(self.symbol, state)
+                            if candidates:
+                                best = max(candidates, key=lambda r: r["decision"]["confidence"] * r["decision"]["expected_r"])
+                                async with self._trade_lock:
+                                    self.stats["last_action"] = f"Executing trade on {best['symbol']}..."
+                                    final_res = await self.engine.run(best, execute=True, streamer=self.streamer)
+                                    self.symbol_states[best['symbol']] = final_res
+                                    state = final_res
+                            else:
+                                state = await self.engine.run(self.symbol_states[self.symbol], execute=False, streamer=self.streamer)
+                                self.symbol_states[self.symbol] = state
+                                atr_map[state["symbol"]] = state["indicators"].get("vol", {}).get("atr", 0)
                         else:
-                            state = await self.engine.run(self.symbol_states[self.symbol], execute=False, streamer=self.streamer)
-                            self.symbol_states[self.symbol] = state
-                            atr_map[state["symbol"]] = state["indicators"].get("vol", {}).get("atr", 0)
-                    else:
-                        state = self.symbol_states.get(self.symbol, state)
-                        state["decision"] = state.get("decision", {"action": "hold", "reason": safety.get("reason", "Trading paused")})
+                            state = self.symbol_states.get(self.symbol, state)
+                            state["decision"] = state.get("decision", {"action": "hold", "reason": safety.get("reason", "Trading paused")})
+                            state["price"] = price_map.get(state["symbol"], state.get("price", 0))
+                            state["balance"] = balance
+                            state["position"] = self._safe_tool_call("get_open_position", None, state["symbol"])
+                            state["recent_trades"] = self._safe_tool_call("get_recent_trades", [], 5)
+                            state["performance"] = self._safe_tool_call("get_performance_metrics", {})
+                            state["today_pnl"] = self._safe_tool_call("get_todays_realized_pnl", 0.0)
+                            state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, state["symbol"], state["price"])
+
+                        # 5. Enrichment for Dashboard
                         state["price"] = price_map.get(state["symbol"], state.get("price", 0))
                         state["balance"] = balance
-                        state["position"] = self.tools.get_open_position(state["symbol"])
-                        state["recent_trades"] = self.tools.get_recent_trades(5)
-                        state["performance"] = self.tools.get_performance_metrics()
-                        state["today_pnl"] = self.tools.get_todays_realized_pnl()
-                        state["unrealized_pnl"] = self.tools.get_unrealized_pnl(state["symbol"], state["price"])
+                        state["position"] = self._safe_tool_call("get_open_position", None, state["symbol"])
+                        state["recent_trades"] = self._safe_tool_call("get_recent_trades", [], 5)
+                        state["performance"] = self._safe_tool_call("get_performance_metrics", {})
+                        state["today_pnl"] = self._safe_tool_call("get_todays_realized_pnl", 0.0)
+                        state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, state["symbol"], state["price"])
 
-                    # 5. Enrichment for Dashboard
-                    state["price"] = price_map.get(state["symbol"], state.get("price", 0))
-                    state["balance"] = balance
-                    state["position"] = self.tools.get_open_position(state["symbol"])
-                    state["recent_trades"] = self.tools.get_recent_trades(5)
-                    state["performance"] = self.tools.get_performance_metrics()
-                    state["today_pnl"] = self.tools.get_todays_realized_pnl()
-                    state["unrealized_pnl"] = self.tools.get_unrealized_pnl(state["symbol"], state["price"])
+                        self.stats["last_action"] = "Elite Engine Idle"
+                    except Exception as e:
+                        self.stats["last_action"] = f"Error: {str(e)[:40]}"
+                        log.exception("Loop error")
+                        self.guard.record_error(e)
                     
-                    self.stats["last_action"] = "Elite Engine Idle"
-                except Exception as e:
-                    self.stats["last_action"] = f"Error: {str(e)[:40]}"
-                    log.exception("Loop error")
-                    self.guard.record_error(e)
-                
-                # Ensure dashboard updates even if logic fails
-                self.update_dashboard(layout, state)
-                self.guard.record_success()
-                dt = time.monotonic() - t0
-                await asyncio.sleep(max(0.5, 3 - dt))
+                    # Ensure dashboard updates even if logic fails
+                    self.update_dashboard(layout, state)
+                    self.guard.record_success()
+                    dt = time.monotonic() - t0
+                    await asyncio.sleep(max(0.5, 3 - dt))
+        finally:
+            self.stop_health_api()
 
 if __name__ == "__main__":
-    asyncio.run(TradeXProClone().start())
+    parser = argparse.ArgumentParser(description="TradeX Pro bot runner")
+    parser.add_argument("--mode", choices=["live", "replay", "backtest"], default=os.getenv("BOT_MODE", "live").lower())
+    parser.add_argument("--symbols", help="Comma-separated symbols to override SYMBOLS")
+    parser.add_argument("--symbol", help="Single symbol override for live/replay/backtest")
+    parser.add_argument("--timeframe", help="Override timeframe")
+    parser.add_argument("--limit", type=int, help="Override data limit for backtest/replay")
+    args = parser.parse_args()
+
+    if args.symbol:
+        os.environ["SYMBOL"] = args.symbol
+        os.environ["SYMBOLS"] = args.symbol
+    elif args.symbols:
+        os.environ["SYMBOLS"] = args.symbols
+
+    if args.timeframe:
+        os.environ["TIMEFRAME"] = args.timeframe
+
+    bot = TradeXProClone()
+    if args.mode == "replay":
+        bot.paper_replay = True
+        if args.limit:
+            bot.paper_replay_limit = args.limit
+        asyncio.run(bot.start())
+    elif args.mode == "backtest":
+        asyncio.run(bot._run_backtest_mode(
+            symbols=[s.strip() for s in (args.symbols or os.getenv("SYMBOLS", bot.symbol)).split(",") if s.strip()],
+            timeframe=args.timeframe or os.getenv("TIMEFRAME", "5m"),
+            limit=args.limit,
+        ))
+    else:
+        asyncio.run(bot.start())

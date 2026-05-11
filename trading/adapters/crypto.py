@@ -80,6 +80,12 @@ class CCXTCryptoAdapter:
     def _public_request(self, method: str, path: str, params: Optional[dict] = None) -> Any:
         return self._request(method, path, params=params, signed=False)
 
+    def _futures_public_request(self, method: str, path: str, params: Optional[dict] = None) -> Any:
+        url = f"https://fapi.binance.com{path}"
+        response = self.session.request(method, url, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+
     def _signed_request(self, method: str, path: str, params: Optional[dict] = None) -> Any:
         if not self.api_key or not self.secret:
             raise ValueError("Binance API key and secret are required for signed requests.")
@@ -589,27 +595,38 @@ class CCXTCryptoAdapter:
 
             exit_side = "sell" if side.lower() == "buy" else "buy"
             if self.trading_mode == "futures":
-                exit_orders = self.place_exit_orders(symbol, "long" if side.lower() == "buy" else "short", float(executed_qty), stop_loss, take_profit)
+                position_side = "long" if side.lower() == "buy" else "short"
+                try:
+                    exit_orders = self.place_exit_orders(symbol, position_side, float(executed_qty), stop_loss, take_profit)
+                except Exception as exc:
+                    log.warning("Failed to place protective exits for %s: %s", symbol, exc)
+                    exit_orders = {"error": str(exc)}
                 return {
                     "entry": entry_order,
                     "sl": exit_orders.get("sl"),
                     "tp": exit_orders.get("tp"),
                     "strategy": "Futures entry + protective exits",
-                    "position_side": "long" if side.lower() == "buy" else "short",
+                    "position_side": position_side,
+                    "exit_error": exit_orders.get("error"),
                 }
 
-            oco = self._place_spot_oco_exit(
-                symbol,
-                exit_side,
-                self.amount_to_precision(symbol, float(executed_qty)),
-                stop_loss,
-                take_profit,
-            )
+            try:
+                oco = self._place_spot_oco_exit(
+                    symbol,
+                    exit_side,
+                    self.amount_to_precision(symbol, float(executed_qty)),
+                    stop_loss,
+                    take_profit,
+                )
+            except Exception as exc:
+                log.warning("Failed to place spot OCO exits for %s: %s", symbol, exc)
+                oco = {"error": str(exc)}
             return {
                 "entry": entry_order,
                 "sl": oco,
                 "tp": oco,
                 "strategy": "Spot OCO protection",
+                "exit_error": oco.get("error"),
             }
         except Exception as e:
             log.error("place_order_with_sl_tp error: %s", e)
@@ -642,9 +659,95 @@ class CCXTCryptoAdapter:
         path = "/fapi/v1/openOrders" if self.trading_mode == "futures" else "/api/v3/openOrders"
         return self._signed_request("GET", path, params)
 
-    def get_open_interest_history(self, symbol: str, limit: int = 10) -> List[Dict]:
-        log.warning("Open interest history is not available on Binance Spot REST API.")
-        return []
+    def get_my_trades(self, symbol: str, from_id: Optional[int] = None, limit: int = 1000) -> List[Dict]:
+        params: Dict[str, Any] = {
+            "symbol": self.get_market_symbol(symbol),
+            "limit": min(max(int(limit or 1), 1), 1000),
+        }
+        if from_id is not None:
+            params["fromId"] = int(from_id)
+
+        path = "/fapi/v1/userTrades" if self.trading_mode == "futures" else "/api/v3/myTrades"
+        raw_trades = self._signed_request("GET", path, params)
+        if not raw_trades:
+            return []
+
+        normalized = []
+        for trade in raw_trades:
+            side_value = trade.get("side")
+            if not side_value:
+                if "isBuyer" in trade:
+                    side_value = "BUY" if bool(trade.get("isBuyer")) else "SELL"
+                elif "buyer" in trade:
+                    side_value = "BUY" if bool(trade.get("buyer")) else "SELL"
+                else:
+                    side_value = ""
+            normalized.append(
+                {
+                    "id": int(trade.get("id", trade.get("tradeId", 0)) or 0),
+                    "orderId": int(trade.get("orderId", 0) or 0),
+                    "symbol": trade.get("symbol", self.get_market_symbol(symbol)),
+                    "side": str(side_value).upper(),
+                    "qty": float(trade.get("qty", trade.get("q", 0.0)) or 0.0),
+                    "price": float(trade.get("price", trade.get("p", 0.0)) or 0.0),
+                    "realizedPnl": float(trade.get("realizedPnl", 0.0) or 0.0),
+                    "commission": float(trade.get("commission", 0.0) or 0.0),
+                    "commissionAsset": trade.get("commissionAsset"),
+                    "time": int(trade.get("time", trade.get("T", 0)) or 0),
+                    "quoteQty": float(trade.get("quoteQty", trade.get("quoteQty", 0.0)) or 0.0),
+                    "positionSide": str(trade.get("positionSide", trade.get("positionSide", "")) or "").upper(),
+                }
+            )
+        return normalized
+
+    def get_open_interest(self, symbol: str) -> Dict:
+        m_symbol = self.get_market_symbol(symbol)
+        try:
+            return self._futures_public_request("GET", "/fapi/v1/openInterest", {"symbol": m_symbol})
+        except Exception as exc:
+            log.warning("Open interest snapshot unavailable for %s: %s", symbol, exc)
+            return {}
+
+    def get_open_interest_history(self, symbol: str, limit: int = 10, period: str = "5m") -> List[Dict]:
+        m_symbol = self.get_market_symbol(symbol)
+        params = {
+            "symbol": m_symbol,
+            "period": period,
+            "limit": min(max(int(limit or 1), 1), 500),
+        }
+        try:
+            raw = self._futures_public_request("GET", "/futures/data/openInterestHist", params)
+        except Exception as exc:
+            log.warning("Open interest history unavailable for %s: %s", symbol, exc)
+            return []
+
+        normalized: List[Dict] = []
+        for row in raw or []:
+            if not isinstance(row, dict):
+                continue
+            normalized.append(
+                {
+                    "symbol": m_symbol,
+                    "period": period,
+                    "timestamp": int(row.get("timestamp", row.get("time", 0)) or 0),
+                    "openInterestAmount": float(
+                        row.get(
+                            "sumOpenInterest",
+                            row.get("openInterest", row.get("openInterestAmount", 0.0)),
+                        )
+                        or 0.0
+                    ),
+                    "openInterestValue": float(
+                        row.get(
+                            "sumOpenInterestValue",
+                            row.get("openInterestValue", 0.0),
+                        )
+                        or 0.0
+                    ),
+                    "raw": row,
+                }
+            )
+        return normalized
 
     def get_listen_key(self) -> Optional[str]:
         if self.paper_trading or not (self.api_key and self.secret):
@@ -666,4 +769,3 @@ class CCXTCryptoAdapter:
                 log.warning("Failed to refresh futures listen key: %s", e)
                 return False
         return False
-

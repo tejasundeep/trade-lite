@@ -159,7 +159,23 @@ def generate_signals(df: pd.DataFrame, indicators: Dict, regime: MarketRegime, h
             if r >= 1.8:
                 signals.append(StrategySignal("sfp_sniper_v2", "buy", 0.78, entry, sl, tp, r, "SFP + OF Delta Flip"))
 
-    return signals
+    # â”€â”€ 4. Symmetric Short Setups â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    for fvg in fvgs:
+        if fvg["type"] == "bearish" and fvg["bottom"] <= entry <= fvg["top"]:
+            if of.get("delta", 0) < 0:
+                sl = fvg["top"] + atr * 0.3
+                tp = entry - atr * 3
+                r  = _safe_r(tp, entry, sl)
+                if r >= 1.5:
+                    signals.append(StrategySignal("fvg_imbalance_sniper", "sell", 0.75, entry, sl, tp, r, "Bearish FVG Entry"))
+
+    if smc.get("liquidity_sweep", {}).get("high") and smc.get("zone") == "Premium":
+        if of.get("delta", 0) < 0 or "Bearish" in of.get("absorption", ""):
+            sl = entry + atr * 0.8
+            tp = pd_arr.get("low", entry - atr * 4)
+            r  = _safe_r(tp, entry, sl)
+            if r >= 1.8:
+                signals.append(StrategySignal("sfp_sniper_v2", "sell", 0.78, entry, sl, tp, r, "SFP + OF Delta Flip"))
 
     return signals
 

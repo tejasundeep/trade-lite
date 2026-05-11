@@ -12,7 +12,7 @@ from indicators.macro import get_macro_analysis
 from indicators.trend_strength import analyze_trend_strength
 from indicators.volatility import analyze_volatility
 from indicators.risk import calculate_risk_parameters
-from indicators.market_context import set_market_data
+from indicators.market_context import set_market_data, is_backtest
 from .edge import build_edge_plan
 
 log = logging.getLogger(__name__)
@@ -23,65 +23,122 @@ class TradingEngine:
         self.tools        = tools
         self.risk_manager = risk_manager
 
-    async def run(self, state: Dict, execute: bool = True, streamer = None, df_override = None, htf_df_override = None) -> Dict:
+    @staticmethod
+    def _ensure_ema_columns(df):
+        if df is None or df.empty:
+            return df
+        frame = df.copy()
+        if "EMA_50" not in frame.columns:
+            frame["EMA_50"] = frame["close"].ewm(span=50, adjust=False).mean()
+        if "EMA_200" not in frame.columns:
+            frame["EMA_200"] = frame["close"].ewm(span=200, adjust=False).mean()
+        return frame
+
+    def _safe_call(self, name: str, default=None, *args, **kwargs):
+        fn = getattr(self.tools, name, None)
+        if not callable(fn):
+            return default
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            log.debug("%s failed: %s", name, exc)
+            return default
+
+    async def run(
+        self,
+        state: Dict,
+        execute: bool = True,
+        streamer=None,
+        df_override=None,
+        htf_df_override=None,
+        htf_levels_override=None,
+        htf_bias_override=None,
+    ) -> Dict:
         symbol = state["symbol"]
 
         # 1. RETRIEVE - Zero Latency Priority
         if df_override is not None:
-            df = df_override
-            price = float(df.iloc[-1]["close"])
+            df = self._ensure_ema_columns(df_override)
         elif streamer:
             df = streamer.get_candles(symbol)
             if df.empty: df = self.tools.get_market_data(symbol)
-            price = streamer.prices.get(symbol, 0.0)
-            if price == 0: 
-                ticker = self.tools.get_ticker(symbol)
-                price = ticker["price"]
+            df = self._ensure_ema_columns(df)
         else:
-            df = self.tools.get_market_data(symbol)
-            ticker = self.tools.get_ticker(symbol)
-            price = ticker["price"]
+            df = self._ensure_ema_columns(self.tools.get_market_data(symbol))
+
+        balance = state.get("balance")
+        if balance is None:
+            balance = self._safe_call("get_balance", 0.0)
+        if df is None or df.empty or "close" not in df.columns:
+            state.update({
+                "df": df if df is not None else None,
+                "price": 0.0,
+                "balance": balance,
+                "position": self._safe_call("get_open_position", None, symbol),
+                "indicators": {},
+                "plan": {"symbol": symbol, "regime": "Unknown", "selected": None, "reason": "No market data"},
+                "decision": {"action": "hold", "reason": "No market data"},
+            })
+            return state
+
+        price = float(df.iloc[-1]["close"])
+        if streamer:
+            price = streamer.prices.get(symbol, 0.0) or price
+            if price == 0:
+                ticker = self._safe_call("get_ticker", {}, symbol) or {}
+                price = float(ticker.get("price", price) or price)
+        else:
+            ticker = self._safe_call("get_ticker", {}, symbol) or {}
+            price = float(ticker.get("price", price) or price)
 
         set_market_data(df)
         
-        balance = state.get("balance") or self.tools.get_balance()
-        if htf_df_override is not None and not htf_df_override.empty:
+        if htf_levels_override is not None:
+            htf_levels = htf_levels_override
+        elif htf_df_override is not None and not htf_df_override.empty:
             htf_levels = self.tools.build_institutional_levels(htf_df_override, htf_df_override)
+        elif is_backtest():
+            htf_levels = state.get("htf_levels", {})
         else:
             htf_levels = self.tools.get_institutional_levels(symbol)
-        position   = self.tools.get_open_position(symbol)
+        position   = self._safe_call("get_open_position", None, symbol)
         
         if position:
-            position["unrealized_pnl"] = self.tools.get_unrealized_pnl(symbol, price)
+            position["unrealized_pnl"] = self._safe_call("get_unrealized_pnl", 0.0, symbol, price)
 
         # 2. ANALYZE — Optimized HTF bias
         # Elite Note: HTF structure (1h) doesn't change every 5 seconds. 
         # We cache it in state to avoid REST call spam.
-        htf_bias = state.get("htf_bias", "Neutral")
+        htf_bias = htf_bias_override or state.get("htf_bias", "Neutral")
         last_htf_update = state.get("last_htf_update", 0)
         
         # Only update HTF bias every 15 minutes or if missing
         import time
         if htf_bias == "Neutral" or (time.time() - last_htf_update > 900) or htf_df_override is not None:
             try:
-                if htf_df_override is not None:
-                    df_htf = htf_df_override
+                if htf_bias_override is not None:
+                    htf_bias = htf_bias_override
                 else:
-                    df_htf = self.tools.get_market_data(symbol, timeframe="1h", limit=200)
-                
-                set_market_data(df_htf)
-                htf_smc  = analyze_smc_structure()
-                htf_bias = htf_smc.get("structure", "Neutral")
-                state["last_htf_update"] = time.time()
-                set_market_data(df)   # restore LTF
+                    if htf_df_override is not None:
+                        df_htf = htf_df_override
+                    else:
+                        df_htf = self.tools.get_market_data(symbol, timeframe="1h", limit=200)
+                    set_market_data(df_htf)
+                    htf_smc  = analyze_smc_structure()
+                    htf_bias = htf_smc.get("structure", "Neutral")
+                    state["last_htf_update"] = time.time()
             except Exception as e:
-                log.warning("HTF fetch failed: %s", e)
+                if htf_bias_override is None:
+                    log.warning("HTF fetch failed: %s", e)
+            finally:
+                set_market_data(df)   # restore LTF
 
         macro = await get_macro_analysis()
 
+        adapter = getattr(self.tools, "adapter", None)
         indicators = {
             "smc":        analyze_smc_structure(htf_structure=htf_bias),
-            "order_flow": analyze_order_flow(symbol, self.tools.adapter, streamer),
+            "order_flow": analyze_order_flow(symbol, adapter, streamer),
             "vwap":       calculate_vwap_analysis(),
             "liquidity":  calculate_liquidity_map(),
             "macro":      macro,
@@ -113,12 +170,13 @@ class TradingEngine:
         price    = state["price"]
         balance  = state["balance"]
         indicators = state.get("indicators", {})
+        position = state.get("position")
 
         if not selected:
             state["decision"] = {"action": "hold", "reason": plan.get("reason", "No edge")}
             return state
 
-        metrics    = self.tools.get_performance_metrics()
+        metrics    = self._safe_call("get_performance_metrics", {})
         
         # Elite Data Extraction
         vol_data = indicators.get("vol", {})
@@ -139,6 +197,19 @@ class TradingEngine:
         if of_data.get("iceberg") != "None":
             confidence = min(1.0, confidence + 0.05)
 
+        if position:
+            position_side = str(position.get("side", "")).lower()
+            current_amount = float(position.get("amount", 0.0) or 0.0)
+            current_notional = current_amount * price
+            exposure_cap = balance * getattr(self.risk_manager.config, "max_position_pct", 0.15)
+            same_direction = (position_side == "long" and selected["action"] == "buy") or (position_side == "short" and selected["action"] == "sell")
+            if same_direction and current_notional >= exposure_cap * 0.9:
+                state["decision"] = {
+                    "action": "hold",
+                    "reason": "Existing position already near exposure cap; skipping add-on",
+                }
+                return state
+
         risk_params = calculate_risk_parameters(
             free_balance     = balance,
             current_price    = price,
@@ -148,7 +219,10 @@ class TradingEngine:
             expected_r       = selected["expected_r"],
             historical_win_rate = metrics.get("win_rate", 0.55),
             total_trades     = metrics.get("total_trades", 0),
-            spread_bps       = spread_bps
+            spread_bps       = spread_bps,
+            max_risk_per_trade_pct = getattr(self.risk_manager.config, "max_risk_per_trade_pct", 0.015),
+            max_position_pct = getattr(self.risk_manager.config, "max_position_pct", 0.15),
+            min_order_quote  = getattr(self.risk_manager.config, "min_order_quote", 10.0),
         )
 
         if risk_params.get("action") == "lock":
@@ -165,6 +239,7 @@ class TradingEngine:
         state["decision"] = {
             "action":             "trade",
             "side":               selected["action"],
+            "trade_side":         selected["action"],
             "recommended_amount": risk_params.get("recommended_amount", 0.0),
             "stop_loss":          selected["stop_loss"],
             "take_profit":        selected["take_profit"],
@@ -212,6 +287,10 @@ class TradingEngine:
                 take_profit=take_profit, reason=decision.get("reason", "Edge"),
             )
             state["execution_result"] = result
+            if result.get("error"):
+                decision["action"] = "hold"
+                decision["reason"] = result.get("error", "Execution failed")
+                state["decision"] = decision
             log.info("Executed %s %s %.6f @ %.2f | Spread %.1f bps",
                      side, symbol, amount, price, spread_bps)
 
