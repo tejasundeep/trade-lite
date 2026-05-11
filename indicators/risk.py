@@ -1,0 +1,100 @@
+from typing import Dict, Optional
+import time
+import json
+from db import get_session, SystemState
+
+_COOLDOWN_KEY = "risk_cooldown"
+
+def _get_state() -> dict:
+    session = get_session()
+    try:
+        row = session.query(SystemState).filter_by(key=_COOLDOWN_KEY).first()
+        if not row:
+            initial = {"last_loss_time": 0, "consecutive_losses": 0, "lock_until": 0}
+            session.add(SystemState(key=_COOLDOWN_KEY, value=json.dumps(initial)))
+            session.commit()
+            return initial
+        return json.loads(row.value)
+    finally:
+        session.close()
+
+def _save_state(data: dict):
+    session = get_session()
+    try:
+        row = session.query(SystemState).filter_by(key=_COOLDOWN_KEY).first()
+        if row:
+            row.value = json.dumps(data)
+            session.commit()
+    finally:
+        session.close()
+
+def calculate_risk_parameters(
+    free_balance: float,
+    current_price: float,
+    confidence_score: float,
+    atr_pct: float = 1.0,
+    stop_loss: Optional[float] = None,
+    expected_r: float = 2.5,
+    historical_win_rate: float = 0.55,
+    total_trades: int = 0,
+    is_last_trade_loss: bool = False,
+    spread_bps: float = 5.0 # Spread in basis points
+) -> Dict:
+    state = _get_state()
+    now   = time.time()
+
+    if is_last_trade_loss:
+        state["consecutive_losses"] += 1
+        state["last_loss_time"]      = now
+        state["lock_until"] = now + (4 ** state["consecutive_losses"]) * 3600
+        _save_state(state)
+    elif state["consecutive_losses"] > 0:
+        state["consecutive_losses"] = 0
+        _save_state(state)
+
+    if now < state["lock_until"]:
+        return {"action": "lock", "reason": "System in Cooldown",
+                "unlock_in_seconds": round(state["lock_until"] - now)}
+
+    # 1. Base Kelly / Flat %
+    if total_trades < 30:
+        final_risk_pct = 0.005
+    else:
+        full_kelly     = (historical_win_rate * expected_r - (1 - historical_win_rate)) / expected_r
+        safe_kelly     = max(0.0, full_kelly * 0.20)
+        final_risk_pct = min(safe_kelly * confidence_score, 0.02)
+
+    # 2. Elite Liquidity Adjustment
+    # If spread > 10% of the ATR, we are in a low-liquidity environment. Reduce risk.
+    liquidity_penalty = 1.0
+    atr_bps = (atr_pct / 100) * 10000
+    if spread_bps > (atr_bps * 0.1):
+        liquidity_penalty = 0.5 # Halve risk if slippage is likely high
+        
+    # 3. Extreme Volatility Guard
+    # If ATR is > 5%, the market is "wild". Cap risk at 0.5%.
+    if atr_pct > 5.0:
+        final_risk_pct = min(final_risk_pct, 0.005)
+        
+    final_risk_pct *= liquidity_penalty
+
+    if stop_loss and stop_loss != current_price:
+        risk_amount  = free_balance * final_risk_pct
+        sl_dist      = abs(current_price - stop_loss)
+        asset_amount = risk_amount / sl_dist if sl_dist > 0 else 0.0
+        notional     = asset_amount * current_price
+        if notional > free_balance:
+            asset_amount = free_balance / current_price
+            notional     = free_balance
+    else:
+        asset_amount = (free_balance * final_risk_pct) / current_price
+        notional     = asset_amount * current_price
+
+    return {
+        "action":           "trade",
+        "recommended_amount": round(asset_amount, 6),
+        "risk_pct":         round(final_risk_pct * 100, 2),
+        "notional_value":   round(notional, 2),
+        "sl_distance_pct":  round(abs(current_price - (stop_loss or 0)) / current_price * 100, 2) if stop_loss else 0,
+        "liquidity_penalty": liquidity_penalty < 1.0
+    }
