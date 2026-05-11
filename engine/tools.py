@@ -18,7 +18,7 @@ _SLIP_BPS  = 0.0005
 
 
 class TradingTools:
-    def __init__(self, api_key: str = None, secret: str = None, paper_trading: bool = True, exchange_id: str = "binanceusdm"):
+    def __init__(self, api_key: str = None, secret: str = None, paper_trading: bool = True, exchange_id: str = "binance"):
         self.adapter      = CCXTCryptoAdapter(exchange_id=exchange_id, api_key=api_key, secret=secret, paper_trading=paper_trading)
         self._day_balance: Optional[float] = None
         self._snap_date:   Optional[date]  = None

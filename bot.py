@@ -144,15 +144,23 @@ class TradeXProClone:
     async def _handle_account_update(self, update: dict):
         """Handle real-time balance and order updates from WebSocket."""
         event = update.get("event")
-        if event in ["ACCOUNT_UPDATE", "outboundAccountPosition"]:
+        if event in ["outboundAccountPosition", "balanceUpdate", "externalLockUpdate"]:
             for b in update.get("balances", []):
                 if b["asset"] == "USDT":
                     self.cached_balance = b["free"]
                     self.last_balance_update = time.time()
                     log.info(f"Real-time Balance Update: {self.cached_balance} USDT")
-        elif event in ["ORDER_TRADE_UPDATE", "executionReport"]:
+            if event == "balanceUpdate" and "balances" not in update:
+                self.last_balance_update = 0
+        elif event == "executionReport":
             order = update.get("order", {})
-            log.info(f"Real-time Order Update: {order['symbol']} {order['side']} {order['status']} at {order['price']}")
+            log.info(
+                "Real-time Order Update: %s %s %s at %s",
+                order.get("symbol", "N/A"),
+                order.get("side", "N/A"),
+                order.get("status", "N/A"),
+                order.get("price", "N/A"),
+            )
             # In a full production system, we'd sync the local DB state here.
             # For now, we log it and let the next cycle pick up changes if any.
 
