@@ -7,6 +7,7 @@ import pandas as pd
 
 from bot import TradeXProClone
 from db import Position, get_session
+from engine.grid import GridConfig, GridManager
 from engine.tools import TradingTools
 from indicators.risk import calculate_risk_parameters
 from trading.streamer import BinanceStreamer
@@ -27,6 +28,53 @@ class _FakeAdapter:
 
     def get_account_balance(self):
         return {"free": {"USDT": 10000.0}, "locked": {"USDT": 0.0}, "paper": True, "mode": "futures"}
+
+
+class _GridFakeAdapter:
+    def __init__(self):
+        self.paper_trading = True
+        self.trading_mode = "futures"
+        self.position_mode = "ONE_WAY"
+        self.api_key = "x"
+        self.secret = "y"
+        self.limit_orders = []
+        self._order_id = 1000
+
+    def get_market_symbol(self, symbol: str) -> str:
+        return symbol.replace("/", "")
+
+    def price_to_precision(self, symbol: str, price: float) -> str:
+        return f"{price:.2f}"
+
+    def amount_to_precision(self, symbol: str, amount: float) -> str:
+        return f"{amount:.6f}"
+
+    def place_limit_order(self, symbol: str, side: str, amount: float, price: float, time_in_force: str = "GTC", reduce_only: bool = False, position_side=None):
+        self._order_id += 1
+        order = {
+            "symbol": self.get_market_symbol(symbol),
+            "side": side.upper(),
+            "amount": amount,
+            "price": price,
+            "timeInForce": time_in_force,
+            "reduceOnly": reduce_only,
+            "orderId": self._order_id,
+            "status": "NEW",
+        }
+        self.limit_orders.append(order)
+        return order
+
+    def cancel_all_open_orders(self, symbol: str):
+        return {"status": "ok"}
+
+    def cancel_order(self, symbol: str, order_id=None, client_order_id=None):
+        return {"status": "ok"}
+
+    def get_open_orders(self, symbol: str = None):
+        return []
+
+    def get_my_trades(self, *args, **kwargs):
+        return []
 
 
 class CoreBehaviorTests(unittest.TestCase):
@@ -131,6 +179,58 @@ class CoreBehaviorTests(unittest.TestCase):
 
         self.assertIn("error", result)
         self.assertIn("rounds to zero", result["error"])
+
+    def test_limit_order_primitive_returns_paper_order_metadata(self):
+        adapter = CCXTCryptoAdapter(
+            exchange_id="binance",
+            paper_trading=True,
+            trading_mode="futures",
+        )
+
+        result = adapter.place_limit_order("BTC/USDT", "buy", 0.1, 65000.0, reduce_only=False)
+
+        self.assertEqual(result["type"], "LIMIT")
+        self.assertEqual(result["status"], "NEW")
+        self.assertIn("orderId", result)
+        self.assertEqual(result["side"], "BUY")
+
+    def test_grid_manager_initializes_and_recycles_buy_levels(self):
+        tools = TradingTools(api_key="x", secret="y", paper_trading=True, exchange_id="binance", trading_mode="futures")
+        tools.adapter = _GridFakeAdapter()
+        grid = GridManager(
+            tools,
+            GridConfig(
+                enabled=True,
+                levels=4,
+                range_pct=0.04,
+                total_quote_pct=0.20,
+                min_order_quote=10.0,
+                recenter_threshold_pct=0.05,
+                refresh_seconds=1,
+                trade_lookback=50,
+                max_inventory_pct=0.20,
+            ),
+        )
+
+        first = grid.sync("BTC/USDT", price=100.0, balance=1000.0)
+        self.assertTrue(first["active"])
+        self.assertEqual(len(tools.adapter.limit_orders), 4)
+        self.assertTrue(all(order["side"] == "BUY" for order in tools.adapter.limit_orders))
+
+        tools.adapter.limit_orders.clear()
+        second = grid.sync("BTC/USDT", price=96.0, balance=1000.0)
+        self.assertGreaterEqual(second["fills_applied"], 1)
+        self.assertTrue(any(order["side"] == "SELL" for order in tools.adapter.limit_orders))
+
+        session = get_session()
+        try:
+            pos = session.query(Position).filter_by(symbol="BTC/USDT").first()
+            self.assertIsNotNone(pos)
+            self.assertGreater(pos.amount, 0.0)
+        finally:
+            session.query(Position).filter_by(symbol="BTC/USDT").delete()
+            session.commit()
+            session.close()
 
     def test_reconcile_preserves_local_positions_when_remote_snapshot_fails(self):
         class _BrokenAdapter:

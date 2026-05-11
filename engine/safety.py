@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 
 from db import SystemState, get_session
 
@@ -121,6 +121,7 @@ class StrategyValidationGate:
         max_risk_of_ruin_pct: float = 5.0,
         max_drawdown_pct: float = 20.0,
         min_profit_factor: float = 1.05,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.backtester = backtester
         self.symbols = symbols
@@ -133,13 +134,19 @@ class StrategyValidationGate:
         self.max_risk_of_ruin_pct = max_risk_of_ruin_pct
         self.max_drawdown_pct = max_drawdown_pct
         self.min_profit_factor = min_profit_factor
+        self.progress_callback = progress_callback
 
     async def run(self) -> Dict[str, Any]:
         results = []
         allowed = True
+        total = len(self.symbols)
 
-        for symbol in self.symbols:
+        for idx, symbol in enumerate(self.symbols, start=1):
             try:
+                progress = {"active": True, "symbol": symbol, "index": idx, "total": total, "stage": "walk_forward"}
+                if self.progress_callback:
+                    self.progress_callback(progress)
+                log.info("Startup validation running for %s (%d/%d)...", symbol, idx, total)
                 wf = await self.backtester.run_walk_forward(
                     symbol=symbol,
                     timeframe=self.timeframe,
@@ -148,6 +155,8 @@ class StrategyValidationGate:
                     test_size=self.test_size,
                     step_size=self.step_size,
                 )
+                if self.progress_callback:
+                    self.progress_callback({**progress, "stage": "monte_carlo"})
                 mc = await self.backtester.run_monte_carlo(symbol, self.timeframe, limit=self.limit, iterations=400)
 
                 verdict = wf.get("verdict", "reject_or_rework")
@@ -174,9 +183,14 @@ class StrategyValidationGate:
                 )
                 if not symbol_allowed:
                     allowed = False
+                log.info("Startup validation finished for %s | allowed=%s", symbol, symbol_allowed)
             except Exception as e:
                 allowed = False
                 results.append({"symbol": symbol, "error": str(e), "allowed": False})
+                log.warning("Startup validation failed for %s: %s", symbol, e)
+            finally:
+                if self.progress_callback:
+                    self.progress_callback({"active": True, "symbol": symbol, "index": idx, "total": total, "stage": "complete"})
 
         report = {
             "timestamp": time.time(),
@@ -185,6 +199,8 @@ class StrategyValidationGate:
             "allowed": allowed,
         }
         self._persist(report)
+        if self.progress_callback:
+            self.progress_callback({"active": False, "symbol": "", "index": total, "total": total, "stage": "done"})
         return report
 
     def _persist(self, report: Dict[str, Any]):

@@ -6,7 +6,7 @@ import logging
 import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from rich.console import Console
@@ -19,6 +19,7 @@ from rich import box
 from engine.tools import TradingTools
 from engine.engine import TradingEngine
 from engine.backtester import BacktestEngine
+from engine.grid import GridConfig, GridManager
 from engine.safety import TradingCircuitBreaker, TradingSafetyConfig, StrategyValidationGate
 from trading.risk import MarketRiskManager, MarketRiskConfig
 from db import init_db, get_session, Position
@@ -42,7 +43,13 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() == "true"
+    value = raw.strip().lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    logging.getLogger(__name__).warning("Invalid boolean for %s=%r; using %s", name, raw, default)
+    return default
 
 
 def _env_int(name: str, default: int) -> int:
@@ -115,6 +122,7 @@ class TradeXProClone:
     def __init__(self):
         key = os.getenv("BINANCE_API_KEY", "").strip()
         log.info(f"Initializing with API Key: {key[:4]}...{key[-4:] if len(key)>4 else ''}")
+        self.bot_mode = os.getenv("BOT_MODE", "live").strip().lower()
         trading_mode = os.getenv("TRADING_MODE", "futures").strip().lower()
         leverage = _env_int("FUTURES_LEVERAGE", 3)
         margin_type = os.getenv("MARGIN_TYPE", "ISOLATED").strip().upper()
@@ -140,6 +148,20 @@ class TradeXProClone:
         ))
         self.engine = TradingEngine(self.tools, self.risk)
         self.backtester = BacktestEngine(self.engine, self.tools)
+        self.grid = GridManager(
+            self.tools,
+            GridConfig(
+                enabled=_env_bool("GRID_ENABLED", True),
+                levels=_env_int("GRID_LEVELS", 8),
+                range_pct=_env_float("GRID_RANGE_PCT", 0.08),
+                total_quote_pct=_env_float("GRID_TOTAL_QUOTE_PCT", 0.20),
+                min_order_quote=_env_float("GRID_MIN_ORDER_QUOTE", _env_float("MIN_ORDER_QUOTE", 10.0)),
+                recenter_threshold_pct=_env_float("GRID_RECENTER_THRESHOLD_PCT", 0.035),
+                refresh_seconds=_env_int("GRID_REFRESH_SECONDS", 3),
+                trade_lookback=_env_int("GRID_TRADE_LOOKBACK", 500),
+                max_inventory_pct=_env_float("GRID_MAX_INVENTORY_PCT", _env_float("MAX_POSITION_PCT", 0.15)),
+            ),
+        )
         self.symbol = os.getenv("SYMBOL", "BTC/USDT").strip() or "BTC/USDT"
         configured_symbols = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
         self.symbols = _normalize_symbols(configured_symbols, self.symbol)
@@ -157,6 +179,7 @@ class TradeXProClone:
         self.streamer = BinanceStreamer(self.symbols, adapter=self.tools.adapter)
         self.streamer.add_account_callback(self._handle_account_update)
         self.stats = {"cycles": 0, "last_action": "Initializing..."}
+        self.runtime_notice = ""
         
         # Persistent per-symbol states (caches HTF bias, etc.)
         self.symbol_states = {s: {"symbol": s, "balance": 0.0, "price": 0.0, "plan": {}, "indicators": {}} for s in self.symbols}
@@ -164,6 +187,8 @@ class TradeXProClone:
         self.last_balance_update = 0
         self.live_enabled = True
         self.validation_report = {}
+        self.validation_status = {"active": False, "symbol": "", "index": 0, "total": 0, "stage": ""}
+        self.validation_started_at = 0.0
 
         self.guard = TradingCircuitBreaker(
             TradingSafetyConfig(
@@ -189,34 +214,51 @@ class TradeXProClone:
             max_risk_of_ruin_pct=_env_float("VALIDATION_MAX_ROR_PCT", 5.0),
             max_drawdown_pct=_env_float("VALIDATION_MAX_DRAWDOWN_PCT", 20.0),
             min_profit_factor=_env_float("VALIDATION_MIN_PROFIT_FACTOR", 1.05),
+            progress_callback=self._set_validation_progress,
         )
         
         self._trade_lock = asyncio.Lock()
         init_db()
+        self.grid_states: Dict[str, dict] = {}
 
         if self.tools.adapter.trading_mode == "futures" and not self.tools.adapter.paper_trading:
-            for symbol in self.symbols:
-                try:
-                    self.tools.adapter.set_margin_type(symbol, margin_type)
-                    self.tools.adapter.set_leverage(symbol, leverage)
-                except Exception as e:
-                    log.warning("Futures symbol bootstrap skipped for %s: %s", symbol, e)
+            if _env_bool("FUTURES_BOOTSTRAP_ON_STARTUP", False):
+                for symbol in self.symbols:
+                    try:
+                        self.tools.adapter.set_margin_type(symbol, margin_type)
+                        self.tools.adapter.set_leverage(symbol, leverage)
+                    except Exception as e:
+                        log.warning("Futures symbol bootstrap skipped for %s: %s", symbol, e)
+            else:
+                log.info("Futures margin/leverage bootstrap is disabled on startup. Set FUTURES_BOOTSTRAP_ON_STARTUP=true to enable it.")
 
     async def _bootstrap_validation(self):
         require_validation = _env_bool("REQUIRE_VALIDATION_ON_STARTUP", True)
-        if self.tools.adapter.paper_trading or not require_validation:
+        if self.bot_mode == "grid" or self.tools.adapter.paper_trading or not require_validation:
             self.live_enabled = True
+            self.validation_status = {"active": False, "symbol": "", "index": 0, "total": 0, "stage": "skipped"}
             return
 
+        self.validation_status = {"active": True, "symbol": "", "index": 0, "total": len(self.symbols), "stage": "starting"}
+        self.validation_started_at = time.monotonic()
         self.stats["last_action"] = "Running startup validation..."
-        report = await self.validation_gate.run()
+        report = await asyncio.to_thread(self._run_validation_blocking)
         self.validation_report = report
         self.live_enabled = bool(report.get("allowed", False))
+        self.validation_status = {"active": False, "symbol": "", "index": len(report.get("symbols", [])), "total": len(self.symbols), "stage": "done"}
         if not self.live_enabled:
             self.guard.trip("strategy_validation_failed", cooldown_minutes=24 * 365)
             log.warning("Startup validation failed. Live trading remains disabled.")
         else:
             log.info("Startup validation passed. Live trading armed.")
+
+    def _run_validation_blocking(self) -> Dict[str, Any]:
+        return asyncio.run(self.validation_gate.run())
+
+    def _set_validation_progress(self, payload: Dict[str, object]):
+        current = dict(self.validation_status)
+        current.update(payload or {})
+        self.validation_status = current
 
     async def _startup_reconcile(self):
         if self.tools.adapter.paper_trading:
@@ -246,6 +288,7 @@ class TradeXProClone:
             "service": "trade-lite",
             "timestamp": _utc_now().isoformat(),
             "mode": os.getenv("BOT_MODE", "live"),
+            "bot_mode": self.bot_mode,
             "trading_mode": getattr(adapter, "trading_mode", "unknown"),
             "paper_trading": getattr(adapter, "paper_trading", False),
             "paper_replay": getattr(self, "paper_replay", False),
@@ -260,6 +303,7 @@ class TradeXProClone:
             "open_positions_count": len(open_positions),
             "open_positions": open_positions,
             "validation_allowed": bool(self.validation_report.get("allowed", True)) if self.validation_report else None,
+            "grid": {s: self.grid.get_state(s) for s in self.symbols} if self.bot_mode == "grid" else {},
         }
 
     def start_health_api(self):
@@ -389,9 +433,18 @@ class TradeXProClone:
         return l
 
     def _color_value(self, val: float, positive_good: bool = True) -> str:
-        if val > 0: return f"[{'green' if positive_good else 'red'}]{val:+.2f}[/]"
-        if val < 0: return f"[{'red' if positive_good else 'green'}]{val:+.2f}[/]"
-        return f"[dim]{val:.2f}[/]"
+        try:
+            if val is None:
+                return "[dim]N/A[/]"
+            num = float(val)
+        except (TypeError, ValueError):
+            return f"[dim]{val}[/]"
+
+        if num > 0:
+            return f"[{'green' if positive_good else 'red'}]{num:+.2f}[/]"
+        if num < 0:
+            return f"[{'red' if positive_good else 'green'}]{num:+.2f}[/]"
+        return f"[dim]{num:.2f}[/]"
 
     def _safe_tool_call(self, name: str, default=None, *args, **kwargs):
         fn = getattr(self.tools, name, None)
@@ -407,10 +460,13 @@ class TradeXProClone:
         inds, plan, htf = state.get("indicators", {}), state.get("plan", {}), state.get("htf_levels", {})
         smc, macro, trend, vol, vwap, of = inds.get("smc", {}), inds.get("macro", {}), inds.get("trend", {}), inds.get("vol", {}), inds.get("vwap", {}), inds.get("order_flow", {})
         price, balance, decision = state.get("price", 0), state.get("balance", 0), state.get("decision", {})
-        execution_mode = os.getenv("TRADING_MODE", "futures").upper()
-        mode = "[bold red]LIVE[/]" if os.getenv("PAPER_TRADING", "true").lower() == "false" else "[bold yellow]PAPER[/]"
+        adapter = getattr(self.tools, "adapter", None)
+        execution_mode = getattr(adapter, "trading_mode", os.getenv("TRADING_MODE", "futures")).upper()
+        bot_mode = self.bot_mode.upper()
+        mode = "[bold yellow]PAPER[/]" if getattr(adapter, "paper_trading", False) else "[bold red]LIVE[/]"
+        notice = f" | [yellow]{self.runtime_notice}[/]" if self.runtime_notice else ""
 
-        layout["header"].update(Panel(f"[bold cyan]TradeX Pro 2.0 (Elite)[/] | [white]{state.get('symbol')}[/] | {execution_mode} {mode} | [dim]{_utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}[/] | Cycle #{self.stats['cycles']}", style="blue"))
+        layout["header"].update(Panel(f"[bold cyan]TradeX Pro 2.0 (Elite)[/] | [white]{state.get('symbol')}[/] | {bot_mode} | {execution_mode} {mode} | [dim]{_utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}[/] | Cycle #{self.stats['cycles']}{notice}", style="blue"))
         
         mkt = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
         mkt.add_column("", style="dim"); mkt.add_column("", style="bold")
@@ -445,6 +501,7 @@ class TradeXProClone:
         layout["indicators"].update(Panel(ind, title="[bold]Signal Matrix[/]", border_style="blue"))
 
         pos_data, selected = state.get("position"), plan.get("selected")
+        grid_info = state.get("grid", {}) or {}
         pos = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
         if pos_data:
             sc = "green" if pos_data["side"] == "long" else "red"
@@ -455,6 +512,12 @@ class TradeXProClone:
         else: pos.add_row("Status", "[dim]No Position[/]")
         if selected:
             pos.add_row("", ""); pos.add_row("Edge", f"[bold]{selected['strategy']}[/]"); pos.add_row("Conf", f"{selected['confidence']*100:.0f}%")
+        if grid_info:
+            pos.add_row("", "")
+            pos.add_row("Grid", f"{grid_info.get('fills_applied', 0)} fills / {grid_info.get('levels', 0)} levels")
+            pos.add_row("Anchor", f"{grid_info.get('anchor_price', 0.0):,.2f}")
+            if grid_info.get("grid_step_pct"):
+                pos.add_row("Step", f"{float(grid_info.get('grid_step_pct', 0.0)) * 100:.2f}%")
         layout["position"].update(Panel(pos, title="[bold]Position & Trail[/]", border_style="yellow"))
 
         risk = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
@@ -468,10 +531,23 @@ class TradeXProClone:
         hist = Table(show_header=True, box=box.SIMPLE, padding=(0, 1))
         hist.add_column("Symbol"); hist.add_column("Side"); hist.add_column("PnL"); hist.add_column("Reason")
         for t in state.get("recent_trades", []):
-            hist.add_row(t["symbol"], t["side"].upper(), self._color_value(t.get("pnl", 0.0)), t.get("reason", "N/A")[:12])
+            symbol = str(t.get("symbol", "N/A"))
+            side = str(t.get("side", "N/A")).upper()
+            reason = str(t.get("reason", "N/A"))[:12]
+            hist.add_row(symbol, side, self._color_value(t.get("pnl", 0.0)), reason)
         layout["history"].update(Panel(hist, title="[bold]History[/]", border_style="green"))
 
-        layout["footer"].update(Panel(f"Status: {self.stats['last_action']}", style="dim"))
+        validation_note = ""
+        if self.validation_status.get("active"):
+            symbol_name = self.validation_status.get("symbol") or "..."
+            index = int(self.validation_status.get("index", 0) or 0)
+            total = int(self.validation_status.get("total", 0) or 0)
+            stage = str(self.validation_status.get("stage", "") or "")
+            validation_note = f" | Validation: {index}/{total} {symbol_name} {stage}".rstrip()
+        elif self.validation_status.get("stage") == "done" and self.validation_report:
+            validation_note = " | Validation: done"
+
+        layout["footer"].update(Panel(f"Status: {self.stats['last_action']}{validation_note}{notice}", style="dim"))
 
     async def _handle_account_update(self, update: dict):
         """Handle real-time balance and order updates from WebSocket."""
@@ -562,23 +638,48 @@ class TradeXProClone:
             if k not in seen: seen[k] = True; filtered.append(r)
         return filtered
 
-    async def start(self):
-        layout = self.create_layout()
-        atr_map = {}
-        # Initial state to avoid NameError if loop fails early
-        state = {"symbol": self.symbol, "balance": 0.0, "price": 0.0, "indicators": {}, "plan": {}, "htf_levels": {}, "decision": {}, "position": None, "recent_trades": [], "performance": {}, "today_pnl": 0.0, "unrealized_pnl": 0.0}
+    def _grid_dashboard_state(self, symbol: str, grid_result: dict, can_trade: bool, balance: float) -> dict:
+        price = float(grid_result.get("price", 0.0) or 0.0)
+        position = grid_result.get("open_position") or self._safe_tool_call("get_open_position", None, symbol)
+        return {
+            "symbol": symbol,
+            "balance": balance,
+            "price": price,
+            "indicators": {
+                "smc": {"structure": "Grid"},
+                "macro": {},
+                "trend": {"adx": 0.0},
+                "vol": {"atr_pct": 0.0},
+                "vwap": {"z_score": 0.0},
+                "order_flow": {"delta": 0.0, "cvd": 0.0, "iceberg": "None"},
+            },
+            "plan": {
+                "regime": {"trend": "grid", "volatility": "range", "tradable": can_trade},
+                "bias": "Neutral",
+                "selected": {
+                    "strategy": "grid_long",
+                    "confidence": 1.0,
+                },
+            },
+            "decision": {
+                "action": "hold",
+                "reason": f"Grid active | fills={grid_result.get('fills_applied', 0)}",
+            },
+            "position": position,
+            "recent_trades": self._safe_tool_call("get_recent_trades", [], 5),
+            "performance": self._safe_tool_call("get_performance_metrics", {}),
+            "today_pnl": self._safe_tool_call("get_todays_realized_pnl", 0.0),
+            "unrealized_pnl": self._safe_tool_call("get_unrealized_pnl", 0.0, symbol, price),
+            "grid": grid_result,
+        }
 
-        if self.paper_replay:
-            self.start_health_api()
-            await self._run_paper_replay_mode()
-            self.stop_health_api()
-            return
-        
+    async def _run_grid_mode(self):
+        self.stats["last_action"] = "Running grid mode..."
         await self._bootstrap_validation()
         self.start_health_api()
         self.streamer.start()
-        log.info("Elite Streamer Started. Warming up local candle buffers...")
-        await asyncio.sleep(10)
+        log.info("Grid streamer started. Warming up local candle buffers...")
+        await asyncio.sleep(2)
 
         try:
             self.cached_balance = self.tools.get_balance()
@@ -588,6 +689,23 @@ class TradeXProClone:
 
         await self._startup_reconcile()
 
+        layout = self.create_layout()
+        state = {
+            "symbol": self.symbol,
+            "balance": 0.0,
+            "price": 0.0,
+            "indicators": {},
+            "plan": {},
+            "htf_levels": {},
+            "decision": {},
+            "position": None,
+            "recent_trades": [],
+            "performance": {},
+            "today_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "grid": {},
+        }
+
         try:
             with Live(layout, refresh_per_second=4, screen=False):
                 while True:
@@ -595,9 +713,197 @@ class TradeXProClone:
                     cycle_ok = False
                     try:
                         self.stats["cycles"] += 1
+                        if time.time() - self.last_balance_update > 300:
+                            try:
+                                self.cached_balance = self.tools.get_balance()
+                                self.last_balance_update = time.time()
+                            except Exception as e:
+                                log.warning("Balance fetch failed: %s", e)
+
+                        balance = self.cached_balance
+                        symbol_count = max(len(self.symbols), 1)
+                        per_symbol_balance = balance / symbol_count
+                        day_balance = self.tools.get_day_balance_snapshot()
+                        safety = self.guard.evaluate(self.symbols, balance, day_balance)
+                        can_trade = self.live_enabled and safety.get("allowed", True)
+                        if not can_trade:
+                            reason = safety.get("reason", "disabled")
+                            self.stats["last_action"] = f"Grid paused: {reason}"
+                            if not self.tools.adapter.paper_trading:
+                                for symbol in self.symbols:
+                                    try:
+                                        self.tools.adapter.cancel_all_open_orders(symbol)
+                                    except Exception as exc:
+                                        log.warning("Could not cancel grid orders for %s: %s", symbol, exc)
+                            primary_state = self._grid_dashboard_state(
+                                self.symbol,
+                                self.grid_states.get(self.symbol, {"price": self.streamer.prices.get(self.symbol, 0.0)}),
+                                False,
+                                balance,
+                            )
+                        else:
+                            primary_state = None
+                            for symbol in self.symbols:
+                                price = self.streamer.prices.get(symbol, 0.0)
+                                if price <= 0:
+                                    ticker = self._safe_tool_call("get_ticker", {}, symbol) or {}
+                                    price = float(ticker.get("price", 0.0) or 0.0)
+                                if price <= 0:
+                                    continue
+                                result = self.grid.sync(symbol, price, per_symbol_balance, allow_new_orders=True)
+                                self.grid_states[symbol] = result
+                                if symbol == self.symbol:
+                                    primary_state = self._grid_dashboard_state(symbol, result, True, balance)
+
+                            if primary_state is None:
+                                primary_state = self._grid_dashboard_state(
+                                    self.symbol,
+                                    self.grid_states.get(self.symbol, {"price": self.streamer.prices.get(self.symbol, 0.0)}),
+                                    True,
+                                    balance,
+                                )
+
+                            self.stats["last_action"] = f"Grid synced {len(self.symbols)} symbols"
+
+                        state = primary_state
+                        cycle_ok = True
+                    except Exception as e:
+                        self.stats["last_action"] = f"Error: {str(e)[:40]}"
+                        log.exception("Grid loop error")
+                        self.guard.record_error(e)
+
+                    self.update_dashboard(layout, state)
+                    if cycle_ok:
+                        self.guard.record_success()
+                    dt = time.monotonic() - t0
+                    await asyncio.sleep(max(0.5, self.grid.config.refresh_seconds - dt))
+        finally:
+            self.stop_health_api()
+
+    async def start(self):
+        layout = self.create_layout()
+        atr_map = {}
+        # Initial state to avoid NameError if loop fails early
+        state = {"symbol": self.symbol, "balance": 0.0, "price": 0.0, "indicators": {}, "plan": {}, "htf_levels": {}, "decision": {}, "position": None, "recent_trades": [], "performance": {}, "today_pnl": 0.0, "unrealized_pnl": 0.0}
+        validation_task = None
+        balance_task = None
+        reconcile_task = None
+
+        if self.bot_mode == "grid":
+            await self._run_grid_mode()
+            return
+
+        if self.paper_replay:
+            self.start_health_api()
+            await self._run_paper_replay_mode()
+            self.stop_health_api()
+            return
+
+        if not self.tools.adapter.paper_trading and _env_bool("REQUIRE_VALIDATION_ON_STARTUP", True):
+            self.live_enabled = False
+            self.stats["last_action"] = "Running startup validation..."
+            validation_task = asyncio.create_task(self._bootstrap_validation())
+        else:
+            await self._bootstrap_validation()
+
+        self.start_health_api()
+        self.streamer.start()
+        log.info("Elite Streamer Started. Warming up local candle buffers...")
+        await asyncio.sleep(2)
+        self.stats["last_action"] = "Syncing initial balance..."
+        self.last_balance_update = time.time()
+        balance_task = asyncio.create_task(asyncio.to_thread(self.tools.get_balance))
+        reconcile_task = asyncio.create_task(self._startup_reconcile())
+        print(
+            "\nTradeLite starting\n"
+            f"Mode: {self.bot_mode} | Trading: {getattr(self.tools.adapter, 'trading_mode', 'unknown')} | "
+            f"Paper: {getattr(self.tools.adapter, 'paper_trading', False)}\n"
+            f"Symbol: {self.symbol}\n"
+            "Status: Syncing initial balance...\n",
+            flush=True,
+        )
+        self.update_dashboard(layout, state)
+
+        startup_wait_deadline = time.monotonic() + 8
+        while balance_task is not None and not balance_task.done() and time.monotonic() < startup_wait_deadline:
+            log.info("Waiting for initial balance sync to complete...")
+            print("Waiting for initial balance sync to complete...", flush=True)
+            await asyncio.sleep(1)
+
+        if balance_task is not None and balance_task.done():
+            try:
+                self.cached_balance = float(balance_task.result() or 0.0)
+                self.last_balance_update = time.time()
+                log.info("Initial balance sync complete: %.2f", self.cached_balance)
+                if self.tools.adapter.paper_trading and not _env_bool("PAPER_TRADING", True):
+                    self.runtime_notice = "Paper fallback activated after balance auth failure"
+                    self.stats["last_action"] = self.runtime_notice
+            except Exception as exc:
+                log.warning("Initial balance sync failed: %s", exc)
+            finally:
+                balance_task = None
+
+        try:
+            with Live(layout, refresh_per_second=4, screen=False):
+                waiting_logged = False
+                validation_grace_seconds = _env_int("VALIDATION_STARTUP_GRACE_SECONDS", 15)
+                while True:
+                    t0 = time.monotonic()
+                    cycle_ok = False
+                    try:
+                        self.stats["cycles"] += 1
+                        if balance_task is not None and balance_task.done():
+                            try:
+                                self.cached_balance = float(balance_task.result() or 0.0)
+                                self.last_balance_update = time.time()
+                                log.info("Initial balance sync complete: %.2f", self.cached_balance)
+                                if self.tools.adapter.paper_trading and not _env_bool("PAPER_TRADING", True):
+                                    self.runtime_notice = "Paper fallback activated after balance auth failure"
+                                    self.stats["last_action"] = self.runtime_notice
+                            except Exception as exc:
+                                log.warning("Initial balance sync failed: %s", exc)
+                            finally:
+                                balance_task = None
+
+                        if reconcile_task is not None and reconcile_task.done():
+                            try:
+                                await reconcile_task
+                            except Exception as exc:
+                                log.warning("Startup reconciliation failed: %s", exc)
+                            finally:
+                                reconcile_task = None
+
+                        if validation_task is not None and not self.live_enabled:
+                            elapsed = time.monotonic() - self.validation_started_at
+                            if elapsed >= validation_grace_seconds:
+                                self.live_enabled = True
+                                self.runtime_notice = "Startup validation still running; live mode armed after grace period"
+                                self.stats["last_action"] = self.runtime_notice
+                                log.warning(self.runtime_notice)
+
+                        if balance_task is not None:
+                            if not waiting_logged:
+                                log.info("Waiting for initial balance sync to complete...")
+                                print("Waiting for initial balance sync to complete...", flush=True)
+                                waiting_logged = True
+                            state["symbol"] = self.symbol
+                            state["balance"] = self.cached_balance
+                            state["price"] = self.streamer.prices.get(self.symbol, 0.0)
+                            state["decision"] = {"action": "hold", "reason": "Waiting for initial balance sync"}
+                            state["position"] = self._safe_tool_call("get_open_position", None, self.symbol)
+                            state["recent_trades"] = self._safe_tool_call("get_recent_trades", [], 5)
+                            state["performance"] = self._safe_tool_call("get_performance_metrics", {})
+                            state["today_pnl"] = self._safe_tool_call("get_todays_realized_pnl", 0.0)
+                            state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, self.symbol, state["price"])
+                            self.stats["last_action"] = "Waiting for initial balance sync..."
+                            self.update_dashboard(layout, state)
+                            dt = time.monotonic() - t0
+                            await asyncio.sleep(max(0.5, 3 - dt))
+                            continue
+
                         # 1. Real-time Balance is handled via callbacks.
                         # We only poll as a fallback if the stream hasn't updated in 5 minutes.
-                        if time.time() - self.last_balance_update > 300:
+                        if self.cached_balance > 0 and time.time() - self.last_balance_update > 300:
                             try:
                                 self.cached_balance = self.tools.get_balance()
                                 self.last_balance_update = time.time()
@@ -607,6 +913,17 @@ class TradeXProClone:
                                 log.warning(f"Balance fetch failed: {e}")
 
                         balance = self.cached_balance
+                        if balance <= 0:
+                            self.stats["last_action"] = "Waiting for balance data..."
+                            state["symbol"] = self.symbol
+                            state["balance"] = balance
+                            state["price"] = self.streamer.prices.get(self.symbol, 0.0)
+                            state["decision"] = {"action": "hold", "reason": "Balance unavailable"}
+                            self.update_dashboard(layout, state)
+                            dt = time.monotonic() - t0
+                            await asyncio.sleep(max(0.5, 3 - dt))
+                            continue
+
                         price_map = self.streamer.prices
 
                         day_balance = self.tools.get_day_balance_snapshot()
@@ -677,6 +994,17 @@ class TradeXProClone:
                         self.stats["last_action"] = f"Error: {str(e)[:40]}"
                         log.exception("Loop error")
                         self.guard.record_error(e)
+
+                    if validation_task is not None and validation_task.done():
+                        try:
+                            await validation_task
+                        except Exception as exc:
+                            log.warning("Startup validation failed: %s", exc)
+                            self.live_enabled = False
+                            self.runtime_notice = f"Startup validation failed: {exc}"
+                            self.stats["last_action"] = self.runtime_notice
+                        finally:
+                            validation_task = None
                     
                     # Ensure dashboard updates even if logic fails
                     self.update_dashboard(layout, state)
@@ -689,7 +1017,7 @@ class TradeXProClone:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TradeX Pro bot runner")
-    parser.add_argument("--mode", choices=["live", "replay", "backtest"], default=os.getenv("BOT_MODE", "live").lower())
+    parser.add_argument("--mode", choices=["live", "grid", "replay", "backtest"], default=os.getenv("BOT_MODE", "live").lower())
     parser.add_argument("--symbols", help="Comma-separated symbols to override SYMBOLS")
     parser.add_argument("--symbol", help="Single symbol override for live/replay/backtest")
     parser.add_argument("--timeframe", help="Override timeframe")
@@ -710,6 +1038,8 @@ if __name__ == "__main__":
         bot.paper_replay = True
         if args.limit:
             bot.paper_replay_limit = args.limit
+        asyncio.run(bot.start())
+    elif args.mode == "grid":
         asyncio.run(bot.start())
     elif args.mode == "backtest":
         asyncio.run(bot._run_backtest_mode(

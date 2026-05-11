@@ -59,6 +59,7 @@ class CCXTCryptoAdapter:
 
         self.recv_window = 5000
         self._paper_balance = float(os.getenv("PAPER_BALANCE", "10000"))
+        self._paper_order_seq = int(time.time() * 1000)
 
         self.session = requests.Session()
         if self.api_key:
@@ -451,6 +452,70 @@ class CCXTCryptoAdapter:
                 "side": side.upper(),
                 "type": "MARKET",
                 "quantity": quantity,
+                "newOrderRespType": "FULL",
+            },
+        )
+
+    def place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        price: float,
+        time_in_force: str = "GTC",
+        reduce_only: bool = False,
+        position_side: Optional[str] = None,
+    ) -> Dict:
+        m_symbol = self.get_market_symbol(symbol)
+        quantity, quantity_error = self._validate_order_quantity(m_symbol, amount)
+        if quantity_error:
+            return {"error": quantity_error, "symbol": m_symbol, "side": side.upper(), "type": "LIMIT"}
+
+        limit_price = self.price_to_precision(m_symbol, price)
+
+        if self.paper_trading:
+            self._paper_order_seq += 1
+            return {
+                "symbol": m_symbol,
+                "side": side.upper(),
+                "type": "LIMIT",
+                "status": "NEW",
+                "orderId": self._paper_order_seq,
+                "executedQty": "0",
+                "origQty": quantity,
+                "price": limit_price,
+                "timeInForce": time_in_force,
+                "paper": True,
+                "reduceOnly": reduce_only,
+                "positionSide": position_side or self._position_side_param(side),
+            }
+
+        if self.trading_mode == "futures":
+            params: Dict[str, Any] = {
+                "symbol": m_symbol,
+                "side": self._futures_order_side(side),
+                "type": "LIMIT",
+                "quantity": quantity,
+                "price": limit_price,
+                "timeInForce": time_in_force,
+                "newOrderRespType": "RESULT",
+            }
+            if reduce_only and self.position_mode != "HEDGE":
+                params["reduceOnly"] = "true"
+            if self.position_mode == "HEDGE":
+                params["positionSide"] = (position_side or self._position_side_param(side) or "").upper()
+            return self._signed_request("POST", "/fapi/v1/order", params)
+
+        return self._signed_request(
+            "POST",
+            "/api/v3/order",
+            {
+                "symbol": m_symbol,
+                "side": side.upper(),
+                "type": "LIMIT",
+                "quantity": quantity,
+                "price": limit_price,
+                "timeInForce": time_in_force,
                 "newOrderRespType": "FULL",
             },
         )

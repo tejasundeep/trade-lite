@@ -333,6 +333,22 @@ class TradingTools:
                     return free
             return 0.0
         except Exception as e:
+            message = f"{type(e).__name__}: {e}".lower()
+            if not self.adapter.paper_trading and any(
+                token in message
+                for token in (
+                    "authenticationerror",
+                    "unauthorized",
+                    "invalid api key",
+                    "api-key format invalid",
+                    "signature for this request is not valid",
+                    "invalid signature",
+                    "code\":-2014",
+                )
+            ):
+                self.adapter.paper_trading = True
+                log.warning("Balance lookup failed auth checks; switching to paper trading mode.")
+                return self.get_balance()
             log.error(f"get_balance error: {e}")
             return 0.0
 
