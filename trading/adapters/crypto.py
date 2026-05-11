@@ -6,8 +6,8 @@ import logging
 import os
 import time
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, List, Optional, Any
-from urllib.parse import urlencode, quote
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlencode
 
 import pandas as pd
 import requests
@@ -17,12 +17,12 @@ log = logging.getLogger(__name__)
 
 class CCXTCryptoAdapter:
     """
-    Binance Spot REST adapter.
+    Binance trading adapter with explicit spot/futures support.
 
-    The project name kept the historical CCXT adapter class name, but the
-    implementation now speaks directly to the official Binance Spot REST API.
-    That keeps the behavior aligned with the current docs instead of relying on
-    wrapper-specific endpoint guesses.
+    The project originally used spot-only execution semantics. This adapter
+    now supports both Binance Spot and Binance USD-M Futures so the strategy
+    layer can express true long/short execution without pretending that spot
+    sells are shorts.
     """
 
     def __init__(
@@ -31,15 +31,32 @@ class CCXTCryptoAdapter:
         api_key: Optional[str] = None,
         secret: Optional[str] = None,
         paper_trading: bool = True,
+        trading_mode: str = "futures",
+        leverage: int = 3,
+        margin_type: str = "ISOLATED",
+        position_mode: str = "ONE_WAY",
     ):
         self.exchange_id = (exchange_id or "binance").lower().strip()
         self.api_key = (api_key or "").strip()
         self.secret = (secret or "").strip()
         self.paper_trading = paper_trading
+        self.trading_mode = (trading_mode or "futures").lower().strip()
+        if self.trading_mode not in {"spot", "futures"}:
+            raise ValueError("trading_mode must be 'spot' or 'futures'")
 
-        self.base_url = "https://api.binance.com"
-        self.ws_url = "wss://stream.binance.com:9443/stream"
-        self.ws_api_url = "wss://ws-api.binance.com:443/ws-api/v3"
+        self.leverage = max(int(leverage or 1), 1)
+        self.margin_type = (margin_type or "ISOLATED").upper().strip()
+        self.position_mode = (position_mode or "ONE_WAY").upper().strip()
+
+        if self.trading_mode == "futures":
+            self.base_url = "https://fapi.binance.com"
+            self.ws_url = "wss://fstream.binance.com/stream"
+            self.ws_user_data_url = "wss://fstream.binance.com/ws"
+        else:
+            self.base_url = "https://api.binance.com"
+            self.ws_url = "wss://stream.binance.com:9443/stream"
+            self.ws_user_data_url = "wss://ws-api.binance.com:443/ws-api/v3"
+
         self.recv_window = 5000
         self._paper_balance = float(os.getenv("PAPER_BALANCE", "10000"))
 
@@ -53,19 +70,26 @@ class CCXTCryptoAdapter:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _public_request(self, method: str, path: str, params: Optional[dict] = None) -> Any:
+    def _request(self, method: str, path: str, params: Optional[dict] = None, signed: bool = False) -> Any:
         url = f"{self.base_url}{path}"
-        response = self.session.request(method, url, params=params, timeout=10)
+        payload = self._signed_payload(params) if signed else params
+        response = self.session.request(method, url, params=payload, timeout=10)
         response.raise_for_status()
         return response.json()
+
+    def _public_request(self, method: str, path: str, params: Optional[dict] = None) -> Any:
+        return self._request(method, path, params=params, signed=False)
 
     def _signed_request(self, method: str, path: str, params: Optional[dict] = None) -> Any:
         if not self.api_key or not self.secret:
             raise ValueError("Binance API key and secret are required for signed requests.")
+        return self._request(method, path, params=params, signed=True)
 
-        payload = self._signed_payload(params)
+    def _listen_key_request(self, method: str, path: str) -> Any:
+        if not self.api_key:
+            raise ValueError("Binance API key is required for listen key requests.")
         url = f"{self.base_url}{path}"
-        response = self.session.request(method, url, params=payload, timeout=10)
+        response = self.session.request(method, url, timeout=10)
         response.raise_for_status()
         return response.json()
 
@@ -75,8 +99,7 @@ class CCXTCryptoAdapter:
         payload.setdefault("recvWindow", self.recv_window)
 
         query = urlencode(payload, doseq=True, quote_via=quote)
-        signature = self._sign_query(query)
-        payload["signature"] = signature
+        payload["signature"] = self._sign_query(query)
         return payload
 
     def _sign_query(self, query: str) -> str:
@@ -96,7 +119,8 @@ class CCXTCryptoAdapter:
 
     def _exchange_info(self) -> Dict[str, Any]:
         if self._exchange_info_cache is None:
-            self._exchange_info_cache = self._public_request("GET", "/api/v3/exchangeInfo")
+            path = "/fapi/v1/exchangeInfo" if self.trading_mode == "futures" else "/api/v3/exchangeInfo"
+            self._exchange_info_cache = self._public_request("GET", path)
         return self._exchange_info_cache
 
     def _symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -140,6 +164,21 @@ class CCXTCryptoAdapter:
                     break
         return self._floor_to_step(price, tick)
 
+    def _market_path(self, resource: str) -> str:
+        prefix = "/fapi/v1" if self.trading_mode == "futures" else "/api/v3"
+        return f"{prefix}/{resource}"
+
+    def _account_path(self, resource: str) -> str:
+        if self.trading_mode == "futures":
+            if resource == "balance":
+                return "/fapi/v2/balance"
+            if resource == "positions":
+                return "/fapi/v2/positionRisk"
+            return f"/fapi/v1/{resource}"
+        if resource == "balance":
+            return "/api/v3/account"
+        return f"/api/v3/{resource}"
+
     # ------------------------------------------------------------------
     # Symbol and market data
     # ------------------------------------------------------------------
@@ -149,7 +188,7 @@ class CCXTCryptoAdapter:
     def get_market_data(self, symbol: str, timeframe: str = "1h", limit: int = 500) -> pd.DataFrame:
         raw_ohlcv = self._public_request(
             "GET",
-            "/api/v3/klines",
+            self._market_path("klines"),
             {"symbol": self.get_market_symbol(symbol), "interval": timeframe, "limit": limit},
         )
         if not raw_ohlcv:
@@ -178,8 +217,8 @@ class CCXTCryptoAdapter:
 
     def get_ticker(self, symbol: str) -> Dict:
         m_symbol = self.get_market_symbol(symbol)
-        last_price = self._public_request("GET", "/api/v3/ticker/price", {"symbol": m_symbol})
-        book_ticker = self._public_request("GET", "/api/v3/ticker/bookTicker", {"symbol": m_symbol})
+        last_price = self._public_request("GET", self._market_path("ticker/price"), {"symbol": m_symbol})
+        book_ticker = self._public_request("GET", self._market_path("ticker/bookTicker"), {"symbol": m_symbol})
 
         bid = float(book_ticker.get("bidPrice", 0.0))
         ask = float(book_ticker.get("askPrice", 0.0))
@@ -198,7 +237,7 @@ class CCXTCryptoAdapter:
     def get_order_book(self, symbol: str, limit: int = 20) -> Dict:
         return self._public_request(
             "GET",
-            "/api/v3/depth",
+            self._market_path("depth"),
             {"symbol": self.get_market_symbol(symbol), "limit": limit},
         )
 
@@ -206,7 +245,7 @@ class CCXTCryptoAdapter:
         try:
             trades = self._public_request(
                 "GET",
-                "/api/v3/aggTrades",
+                self._market_path("aggTrades"),
                 {"symbol": self.get_market_symbol(symbol), "startTime": since_ms},
             )
             if not trades:
@@ -235,7 +274,7 @@ class CCXTCryptoAdapter:
             return {"delta": 0, "error": str(e)}
 
     # ------------------------------------------------------------------
-    # Account and order management
+    # Account, positions, and orders
     # ------------------------------------------------------------------
     def get_account_balance(self) -> Dict:
         if self.paper_trading and not (self.api_key and self.secret):
@@ -243,16 +282,105 @@ class CCXTCryptoAdapter:
                 "free": {"USDT": self._paper_balance},
                 "locked": {"USDT": 0.0},
                 "paper": True,
+                "mode": self.trading_mode,
             }
 
-        account = self._signed_request("GET", "/api/v3/account")
+        if self.trading_mode == "futures":
+            account = self._signed_request("GET", self._account_path("balance"))
+            free = {
+                row["asset"]: float(row.get("availableBalance", row.get("balance", 0.0)))
+                for row in account
+            }
+            locked = {row["asset"]: float(row.get("balance", 0.0)) for row in account}
+            return {"free": free, "locked": locked, "mode": "futures"}
+
+        account = self._signed_request("GET", self._account_path("balance"))
         free = {b["asset"]: float(b["free"]) for b in account.get("balances", [])}
         locked = {b["asset"]: float(b["locked"]) for b in account.get("balances", [])}
         account["free"] = free
         account["locked"] = locked
+        account["mode"] = "spot"
         return account
 
-    def place_market_order(self, symbol: str, side: str, amount: float) -> Dict:
+    def set_leverage(self, symbol: str, leverage: Optional[int] = None) -> Dict:
+        if self.trading_mode != "futures" or self.paper_trading or not (self.api_key and self.secret):
+            return {"mode": self.trading_mode, "paper": self.paper_trading, "leverage": leverage or self.leverage}
+
+        return self._signed_request(
+            "POST",
+            "/fapi/v1/leverage",
+            {"symbol": self.get_market_symbol(symbol), "leverage": int(leverage or self.leverage)},
+        )
+
+    def set_margin_type(self, symbol: str, margin_type: Optional[str] = None) -> Dict:
+        if self.trading_mode != "futures" or self.paper_trading or not (self.api_key and self.secret):
+            return {"mode": self.trading_mode, "paper": self.paper_trading, "marginType": margin_type or self.margin_type}
+
+        try:
+            return self._signed_request(
+                "POST",
+                "/fapi/v1/marginType",
+                {"symbol": self.get_market_symbol(symbol), "marginType": (margin_type or self.margin_type).upper()},
+            )
+        except requests.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            if response is not None and response.status_code == 400:
+                body = response.text or ""
+                if "No need to change margin type" in body:
+                    return {"status": "unchanged", "marginType": (margin_type or self.margin_type).upper()}
+            raise
+
+    def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict]:
+        if self.trading_mode != "futures":
+            return []
+
+        rows = self._signed_request("GET", self._account_path("positions"))
+        m_symbol = self.get_market_symbol(symbol) if symbol else None
+        positions = []
+        for row in rows:
+            market_symbol = row.get("symbol")
+            if m_symbol and market_symbol != m_symbol:
+                continue
+
+            position_amt = float(row.get("positionAmt", 0.0))
+            if abs(position_amt) <= 1e-12:
+                continue
+
+            position_side = row.get("positionSide", "BOTH").upper()
+            side = "long" if (position_side == "LONG" or position_amt > 0) else "short"
+            positions.append(
+                {
+                    "symbol": market_symbol,
+                    "market_symbol": market_symbol,
+                    "side": side,
+                    "amount": abs(position_amt),
+                    "entry_price": float(row.get("entryPrice", 0.0)),
+                    "unrealized_pnl": float(row.get("unRealizedProfit", 0.0)),
+                    "leverage": float(row.get("leverage", 0.0)),
+                    "margin_type": row.get("marginType", ""),
+                    "position_side": position_side,
+                }
+            )
+        return positions
+
+    def _futures_order_side(self, side: str) -> str:
+        return side.upper().strip()
+
+    def _position_side_param(self, side: str) -> Optional[str]:
+        if self.trading_mode != "futures":
+            return None
+        if self.position_mode != "HEDGE":
+            return None
+        return "LONG" if side.lower() == "buy" else "SHORT"
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        reduce_only: bool = False,
+        position_side: Optional[str] = None,
+    ) -> Dict:
         m_symbol = self.get_market_symbol(symbol)
         quantity = self.amount_to_precision(m_symbol, amount)
 
@@ -266,7 +394,23 @@ class CCXTCryptoAdapter:
                 "origQty": quantity,
                 "cummulativeQuoteQty": "0",
                 "paper": True,
+                "reduceOnly": reduce_only,
+                "positionSide": position_side or self._position_side_param(side),
             }
+
+        if self.trading_mode == "futures":
+            params: Dict[str, Any] = {
+                "symbol": m_symbol,
+                "side": self._futures_order_side(side),
+                "type": "MARKET",
+                "quantity": quantity,
+                "newOrderRespType": "RESULT",
+            }
+            if reduce_only:
+                params["reduceOnly"] = "true"
+            if self.position_mode == "HEDGE":
+                params["positionSide"] = (position_side or self._position_side_param(side) or "").upper()
+            return self._signed_request("POST", "/fapi/v1/order", params)
 
         return self._signed_request(
             "POST",
@@ -280,7 +424,13 @@ class CCXTCryptoAdapter:
             },
         )
 
-    def _place_entry_order(self, symbol: str, side: str, amount: float, price: float) -> Dict:
+    def _place_entry_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        price: float,
+    ) -> Dict:
         m_symbol = self.get_market_symbol(symbol)
         quantity = self.amount_to_precision(m_symbol, amount)
         limit_price = self.price_to_precision(m_symbol, price)
@@ -297,6 +447,9 @@ class CCXTCryptoAdapter:
                 "paper": True,
             }
 
+        if self.trading_mode == "futures":
+            return self.place_market_order(symbol, side, amount, reduce_only=False)
+
         return self._signed_request(
             "POST",
             "/api/v3/order",
@@ -311,16 +464,14 @@ class CCXTCryptoAdapter:
             },
         )
 
-    def _place_oco_exit(self, symbol: str, side: str, quantity: str, stop_loss: float, take_profit: float) -> Dict:
+    def _place_spot_oco_exit(self, symbol: str, side: str, quantity: str, stop_loss: float, take_profit: float) -> Dict:
         m_symbol = self.get_market_symbol(symbol)
         if side.lower() == "buy":
-            # Closing a short: stop above, take profit below.
             above_price = self.price_to_precision(m_symbol, stop_loss)
             above_stop = self.price_to_precision(m_symbol, stop_loss)
             below_price = self.price_to_precision(m_symbol, take_profit)
             below_stop = self.price_to_precision(m_symbol, take_profit)
         else:
-            # Closing a long: take profit above, stop below.
             above_price = self.price_to_precision(m_symbol, take_profit)
             above_stop = self.price_to_precision(m_symbol, take_profit)
             below_price = self.price_to_precision(m_symbol, stop_loss)
@@ -354,53 +505,165 @@ class CCXTCryptoAdapter:
             },
         )
 
-    def place_order_with_sl_tp(self, symbol: str, side: str, amount: float, price: float, stop_loss: float, take_profit: float) -> Dict:
+    def _place_futures_exit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: str,
+        trigger_price: float,
+        order_type: str,
+        reduce_only: bool = True,
+    ) -> Dict:
+        if self.paper_trading:
+            return {
+                "symbol": self.get_market_symbol(symbol),
+                "type": order_type,
+                "status": "NEW",
+                "paper": True,
+                "side": side.upper(),
+                "quantity": quantity,
+                "triggerPrice": trigger_price,
+                "reduceOnly": reduce_only,
+            }
+
+        params: Dict[str, Any] = {
+            "symbol": self.get_market_symbol(symbol),
+            "side": side.upper(),
+            "type": order_type,
+            "quantity": quantity,
+            "stopPrice": self.price_to_precision(symbol, trigger_price),
+            "reduceOnly": "true" if reduce_only else "false",
+            "workingType": "MARK_PRICE",
+            "priceProtect": "TRUE",
+            "newOrderRespType": "RESULT",
+        }
+        if self.position_mode == "HEDGE":
+            params["positionSide"] = "LONG" if side.lower() == "sell" else "SHORT"
+        return self._signed_request("POST", "/fapi/v1/order", params)
+
+    def place_exit_orders(
+        self,
+        symbol: str,
+        position_side: str,
+        amount: float,
+        stop_loss: float,
+        take_profit: float,
+    ) -> Dict:
+        m_symbol = self.get_market_symbol(symbol)
+        quantity = self.amount_to_precision(m_symbol, amount)
+        exit_side = "sell" if position_side.lower() == "long" else "buy"
+
+        if self.trading_mode == "futures":
+            return {
+                "symbol": m_symbol,
+                "sl": self._place_futures_exit_order(symbol, exit_side, quantity, stop_loss, "STOP_MARKET", reduce_only=True),
+                "tp": self._place_futures_exit_order(symbol, exit_side, quantity, take_profit, "TAKE_PROFIT_MARKET", reduce_only=True),
+                "strategy": "Futures bracket exits",
+            }
+
+        return {
+            "symbol": m_symbol,
+            "oco": self._place_spot_oco_exit(symbol, exit_side, quantity, stop_loss, take_profit),
+            "strategy": "Spot OCO protection",
+        }
+
+    def place_order_with_sl_tp(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        price: float,
+        stop_loss: float,
+        take_profit: float,
+    ) -> Dict:
         try:
             entry_order = self._place_entry_order(symbol, side, amount, price)
-            filled_qty = Decimal(str(entry_order.get("executedQty", entry_order.get("origQty", "0"))))
+            executed_qty = Decimal(str(entry_order.get("executedQty", entry_order.get("origQty", "0")) or "0"))
             order_status = str(entry_order.get("status", "")).upper()
 
+            if executed_qty <= 0:
+                return {"entry": entry_order, "error": "Entry not filled"}
+
+            if order_status and order_status not in {"FILLED", "PARTIALLY_FILLED", "NEW"}:
+                return {"entry": entry_order, "error": f"Unexpected entry status: {order_status}"}
+
             exit_side = "sell" if side.lower() == "buy" else "buy"
-            sl_order = None
-            tp_order = None
+            if self.trading_mode == "futures":
+                exit_orders = self.place_exit_orders(symbol, "long" if side.lower() == "buy" else "short", float(executed_qty), stop_loss, take_profit)
+                return {
+                    "entry": entry_order,
+                    "sl": exit_orders.get("sl"),
+                    "tp": exit_orders.get("tp"),
+                    "strategy": "Futures entry + protective exits",
+                    "position_side": "long" if side.lower() == "buy" else "short",
+                }
 
-            if order_status == "FILLED" and filled_qty > 0:
-                exit_qty = self.amount_to_precision(symbol, float(filled_qty))
-                oco = self._place_oco_exit(symbol, exit_side, exit_qty, stop_loss, take_profit)
-                sl_order = oco
-                tp_order = oco
-
+            oco = self._place_spot_oco_exit(
+                symbol,
+                exit_side,
+                self.amount_to_precision(symbol, float(executed_qty)),
+                stop_loss,
+                take_profit,
+            )
             return {
                 "entry": entry_order,
-                "sl": sl_order,
-                "tp": tp_order,
+                "sl": oco,
+                "tp": oco,
                 "strategy": "Spot OCO protection",
             }
         except Exception as e:
             log.error("place_order_with_sl_tp error: %s", e)
             return {"error": str(e)}
 
-    def cancel_order(self, symbol: str, order_id: Optional[int] = None, client_order_id: Optional[str] = None) -> Dict:
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: Optional[int] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Dict:
         params = {"symbol": self.get_market_symbol(symbol)}
         if order_id is not None:
             params["orderId"] = order_id
         if client_order_id:
             params["origClientOrderId"] = client_order_id
-        return self._signed_request("DELETE", "/api/v3/order", params)
+
+        path = "/fapi/v1/order" if self.trading_mode == "futures" else "/api/v3/order"
+        return self._signed_request("DELETE", path, params)
+
+    def cancel_all_open_orders(self, symbol: str) -> Dict:
+        params = {"symbol": self.get_market_symbol(symbol)}
+        path = "/fapi/v1/allOpenOrders" if self.trading_mode == "futures" else "/api/v3/openOrders"
+        return self._signed_request("DELETE", path, params)
 
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
         params = {}
         if symbol:
             params["symbol"] = self.get_market_symbol(symbol)
-        return self._signed_request("GET", "/api/v3/openOrders", params)
+        path = "/fapi/v1/openOrders" if self.trading_mode == "futures" else "/api/v3/openOrders"
+        return self._signed_request("GET", path, params)
 
     def get_open_interest_history(self, symbol: str, limit: int = 10) -> List[Dict]:
         log.warning("Open interest history is not available on Binance Spot REST API.")
         return []
 
     def get_listen_key(self) -> Optional[str]:
+        if self.paper_trading or not (self.api_key and self.secret):
+            return None
+
+        if self.trading_mode == "futures":
+            data = self._listen_key_request("POST", "/fapi/v1/listenKey")
+            return data.get("listenKey")
+
         log.warning("Spot user data now uses the Binance WebSocket API; listenKey is not used.")
         return None
 
     def keep_alive_listen_key(self, listen_key: str) -> bool:
+        if self.trading_mode == "futures":
+            try:
+                self._listen_key_request("PUT", "/fapi/v1/listenKey")
+                return True
+            except Exception as e:
+                log.warning("Failed to refresh futures listen key: %s", e)
+                return False
         return False
+

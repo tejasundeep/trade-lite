@@ -18,10 +18,52 @@ _SLIP_BPS  = 0.0005
 
 
 class TradingTools:
-    def __init__(self, api_key: str = None, secret: str = None, paper_trading: bool = True, exchange_id: str = "binance"):
-        self.adapter      = CCXTCryptoAdapter(exchange_id=exchange_id, api_key=api_key, secret=secret, paper_trading=paper_trading)
+    def __init__(
+        self,
+        api_key: str = None,
+        secret: str = None,
+        paper_trading: bool = True,
+        exchange_id: str = "binance",
+        trading_mode: str = "futures",
+        leverage: int = 3,
+        margin_type: str = "ISOLATED",
+        position_mode: str = "ONE_WAY",
+    ):
+        self.adapter = CCXTCryptoAdapter(
+            exchange_id=exchange_id,
+            api_key=api_key,
+            secret=secret,
+            paper_trading=paper_trading,
+            trading_mode=trading_mode,
+            leverage=leverage,
+            margin_type=margin_type,
+            position_mode=position_mode,
+        )
         self._day_balance: Optional[float] = None
         self._snap_date:   Optional[date]  = None
+
+    def get_day_balance_snapshot(self) -> float:
+        return self._get_day_balance_snapshot()
+
+    def build_institutional_levels(self, df_d: Optional[pd.DataFrame] = None, df_w: Optional[pd.DataFrame] = None) -> Dict:
+        levels = {}
+        try:
+            if df_d is not None and not df_d.empty:
+                levels.update({
+                    "pdh": float(df_d.iloc[:-1]["high"].max()) if len(df_d) > 1 else float(df_d.iloc[-1]["high"]),
+                    "pdl": float(df_d.iloc[:-1]["low"].min()) if len(df_d) > 1 else float(df_d.iloc[-1]["low"]),
+                    "pdo": float(df_d.iloc[0]["open"]),
+                    "pdc": float(df_d.iloc[-1]["close"]),
+                })
+            if df_w is not None and not df_w.empty:
+                levels.update({
+                    "weekly_open": float(df_w.iloc[-1]["open"]),
+                    "pwh": float(df_w.iloc[:-1]["high"].max()) if len(df_w) > 1 else float(df_w.iloc[-1]["high"]),
+                    "pwl": float(df_w.iloc[:-1]["low"].min()) if len(df_w) > 1 else float(df_w.iloc[-1]["low"]),
+                })
+        except Exception as e:
+            log.debug("build_institutional_levels fallback: %s", e)
+        return levels
 
     def get_market_data(self, symbol: str, timeframe: str = "1h", limit: int = 500) -> pd.DataFrame:
         m_symbol = self.adapter.get_market_symbol(symbol)
@@ -32,26 +74,13 @@ class TradingTools:
         return df
 
     def get_institutional_levels(self, symbol: str) -> Dict:
-        levels = {}
         try:
             m_symbol = self.adapter.get_market_symbol(symbol)
             df_d = self.adapter.get_market_data(m_symbol, "1d", 5)
-            if not df_d.empty:
-                levels.update({
-                    "pdh": float(df_d.iloc[-2]["high"]),
-                    "pdl": float(df_d.iloc[-2]["low"]),
-                    "pdo": float(df_d.iloc[-2]["open"]),
-                    "pdc": float(df_d.iloc[-2]["close"]),
-                })
             df_w = self.adapter.get_market_data(m_symbol, "1w", 3)
-            if not df_w.empty:
-                levels.update({
-                    "weekly_open": float(df_w.iloc[-1]["open"]),
-                    "pwh": float(df_w.iloc[-2]["high"]),
-                    "pwl": float(df_w.iloc[-2]["low"]),
-                })
+            return self.build_institutional_levels(df_d, df_w)
         except Exception: pass
-        return levels
+        return {}
 
     def get_ticker(self, symbol: str) -> Dict:
         m_symbol = self.adapter.get_market_symbol(symbol)
@@ -108,6 +137,79 @@ class TradingTools:
         finally:
             session.close()
 
+    def sync_positions_from_exchange(self, symbols: Optional[List[str]] = None):
+        """
+        Reconcile local position state with futures exchange truth.
+
+        This keeps the bot from drifting after reconnects, crashes, or partial
+        fills. In spot mode or paper mode the local DB remains the source of truth.
+        """
+        if self.adapter.paper_trading or self.adapter.trading_mode != "futures":
+            return
+
+        session = get_session()
+        try:
+            target_symbols = symbols or []
+            symbol_lookup = {self.adapter.get_market_symbol(s): s for s in target_symbols} if target_symbols else {}
+            remote_positions = {p["market_symbol"]: p for p in self.adapter.get_open_positions()}
+            if target_symbols:
+                allowed = set(symbol_lookup.keys())
+                remote_positions = {ms: pos for ms, pos in remote_positions.items() if ms in allowed}
+            tracked_symbols = set(target_symbols) | {symbol_lookup.get(ms, ms) for ms in remote_positions.keys()}
+
+            for symbol in tracked_symbols:
+                market_symbol = self.adapter.get_market_symbol(symbol)
+                remote = remote_positions.get(market_symbol)
+                local = session.query(Position).filter_by(symbol=symbol).first()
+                stop_loss = 0.0
+                take_profit = 0.0
+                try:
+                    open_orders = self.adapter.get_open_orders(symbol)
+                    for order in open_orders:
+                        order_type = str(order.get("type", "")).upper()
+                        trigger = float(order.get("stopPrice", order.get("price", 0.0)) or 0.0)
+                        if order_type in {"STOP_MARKET", "STOP_LOSS_MARKET", "STOP_LOSS_LIMIT"}:
+                            stop_loss = trigger
+                        elif order_type in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT_LIMIT"}:
+                            take_profit = trigger
+                except Exception:
+                    pass
+
+                if remote and remote.get("amount", 0.0) > 0:
+                    side = remote.get("side", "long")
+                    amount = float(remote.get("amount", 0.0))
+                    avg_price = float(remote.get("entry_price", 0.0))
+
+                    if local:
+                        local.avg_price = avg_price or local.avg_price
+                        local.amount = amount
+                        local.side = side
+                        if stop_loss > 0:
+                            local.stop_loss = stop_loss
+                        if take_profit > 0:
+                            local.take_profit = take_profit
+                    else:
+                        session.add(
+                            Position(
+                                symbol=symbol,
+                                avg_price=avg_price,
+                                amount=amount,
+                                side=side,
+                                stop_loss=stop_loss,
+                                take_profit=take_profit,
+                                tp1_hit=False,
+                            )
+                        )
+                elif local:
+                    session.delete(local)
+
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            log.warning("sync_positions_from_exchange error: %s", e)
+        finally:
+            session.close()
+
     def manage_open_positions(self, prices: Dict[str, float], atr_map: Dict[str, float], smc_map: Dict[str, Dict] = None):
         """Scale out at 1:1 R/R, move SL to breakeven+, and trail the remainder structurally."""
         session = get_session()
@@ -132,15 +234,17 @@ class TradingTools:
                         m_symbol = self.adapter.get_market_symbol(pos.symbol)
                         close_amt = pos.amount * 0.5
                         side = "sell" if pos.side == "long" else "buy"
-                        self.adapter.place_market_order(m_symbol, side, close_amt)
+                        result = self.adapter.place_market_order(m_symbol, side, close_amt, reduce_only=True)
+                        closed_qty = float(result.get("executedQty", close_amt) or close_amt)
                         
                         # BE+ (entry + 15bps to cover slippage/fees)
                         be_plus = pos.avg_price * 1.0015 if pos.side == "long" else pos.avg_price * 0.9985
-                        pos.amount -= close_amt
+                        pos.amount = max(pos.amount - closed_qty, 0.0)
                         pos.stop_loss = be_plus
                         pos.tp1_hit = True
                         pos.trailing_stop_price = be_plus
                         session.commit()
+                        self._refresh_exchange_exits(pos)
                         continue
 
                 # 2. Structural Trailing Stop
@@ -152,19 +256,29 @@ class TradingTools:
                     if pos.side == "long":
                         atr_trail = price - atr * 2.0
                         struct_trail = pd_arr.get("low", 0) # Support pivot
-                        potential_trail = max(atr_trail, struct_trail, pos.trailing_stop_price or 0)
-                        if potential_trail > pos.trailing_stop_price:
+                        current_trail = pos.trailing_stop_price or 0
+                        potential_trail = max(atr_trail, struct_trail, current_trail)
+                        trail_changed = potential_trail > current_trail
+                        if trail_changed:
                             pos.trailing_stop_price = potential_trail
-                        if price < pos.trailing_stop_price:
+                        if pos.trailing_stop_price and price < pos.trailing_stop_price:
                             self._execute_full_close(session, pos, price, "Structural Trail Exit")
+                        elif trail_changed:
+                            session.commit()
+                            self._refresh_exchange_exits(pos)
                     else:
                         atr_trail = price + atr * 2.0
                         struct_trail = pd_arr.get("high", 999999999) # Resistance pivot
-                        potential_trail = min(atr_trail, struct_trail, pos.trailing_stop_price or 999999999)
-                        if potential_trail < pos.trailing_stop_price:
+                        current_trail = pos.trailing_stop_price or 999999999
+                        potential_trail = min(atr_trail, struct_trail, current_trail)
+                        trail_changed = potential_trail < current_trail
+                        if trail_changed:
                             pos.trailing_stop_price = potential_trail
-                        if price > pos.trailing_stop_price:
+                        if pos.trailing_stop_price and price > pos.trailing_stop_price:
                             self._execute_full_close(session, pos, price, "Structural Trail Exit")
+                        elif trail_changed:
+                            session.commit()
+                            self._refresh_exchange_exits(pos)
                     session.commit()
 
         except Exception as e:
@@ -176,12 +290,22 @@ class TradingTools:
         log.info(f"Exiting full position {pos.symbol} via {reason}")
         m_symbol = self.adapter.get_market_symbol(pos.symbol)
         side = "sell" if pos.side == "long" else "buy"
-        self.adapter.place_market_order(m_symbol, side, pos.amount)
+        original_amount = pos.amount
+        result = self.adapter.place_market_order(m_symbol, side, pos.amount, reduce_only=True)
+        closed_qty = float(result.get("executedQty", original_amount) or original_amount)
         fill_px = price * (1 - (_SLIP_BPS + _FEE_BPS)) if side == "sell" else price * (1 + (_SLIP_BPS + _FEE_BPS))
-        pnl = (fill_px - pos.avg_price) * pos.amount * (1 if pos.side == "long" else -1)
-        session.add(Trade(symbol=pos.symbol, side=side, price=fill_px, amount=pos.amount,
+        pnl = (fill_px - pos.avg_price) * closed_qty * (1 if pos.side == "long" else -1)
+        session.add(Trade(symbol=pos.symbol, side=side, price=fill_px, amount=closed_qty,
                          pnl=pnl, status="closed", reason=reason))
-        session.delete(pos)
+        if closed_qty >= original_amount * 0.999:
+            session.delete(pos)
+        else:
+            pos.amount = max(pos.amount - closed_qty, 0.0)
+        session.commit()
+        if closed_qty >= original_amount * 0.999:
+            self._cancel_exchange_orders(pos.symbol)
+        else:
+            self._refresh_exchange_exits(pos)
 
     def get_unrealized_pnl(self, symbol: str, current_price: float) -> float:
         pos = self.get_open_position(symbol)
@@ -237,26 +361,61 @@ class TradingTools:
             is_closing = pos and ((pos.side == "long" and side == "sell") or (pos.side == "short" and side == "buy"))
 
             result = self.adapter.place_order_with_sl_tp(m_symbol, side, amount, price, stop_loss, take_profit)
-            fill_price = price * (1 + (_SLIP_BPS + _FEE_BPS)) if side == "buy" else price * (1 - (_SLIP_BPS + _FEE_BPS))
+            if result.get("error"):
+                session.rollback()
+                return result
+
+            executed_qty = float(
+                result.get("entry", {}).get("executedQty", result.get("entry", {}).get("origQty", amount)) or amount
+            )
+            if executed_qty <= 0:
+                session.rollback()
+                return {"error": "Order did not fill"}
+
+            fill_price = price
+            entry_payload = result.get("entry", {})
+            try:
+                entry_price = float(entry_payload.get("avgPrice") or entry_payload.get("price") or 0.0)
+                if entry_price > 0:
+                    fill_price = entry_price
+            except Exception:
+                pass
+
+            if self.adapter.trading_mode == "futures" and not self.adapter.paper_trading and pos is None:
+                try:
+                    self.adapter.set_margin_type(symbol)
+                    self.adapter.set_leverage(symbol)
+                except Exception as e:
+                    log.warning("futures symbol config skipped for %s: %s", symbol, e)
+
+            if side == "buy":
+                fill_price = fill_price * (1 + (_SLIP_BPS + _FEE_BPS))
+            else:
+                fill_price = fill_price * (1 - (_SLIP_BPS + _FEE_BPS))
 
             realized_pnl = None
             if is_closing and pos:
                 factor = 1 if pos.side == "long" else -1
-                realized_pnl = (fill_price - pos.avg_price) * min(amount, pos.amount) * factor
+                realized_pnl = (fill_price - pos.avg_price) * min(executed_qty, pos.amount) * factor
 
-            session.add(Trade(symbol=symbol, side=side, price=fill_price, amount=amount,
+            session.add(Trade(symbol=symbol, side=side, price=fill_price, amount=executed_qty,
                              pnl=realized_pnl, status="closed" if is_closing else "open", reason=reason))
 
             if is_closing and pos:
-                if amount >= pos.amount: session.delete(pos)
-                else: pos.amount -= amount
+                if executed_qty >= pos.amount:
+                    session.delete(pos)
+                    self._cancel_exchange_orders(symbol)
+                else:
+                    pos.amount -= executed_qty
+                    self._refresh_exchange_exits(pos)
             elif pos and not is_closing:
-                total = pos.amount + amount
-                pos.avg_price = (pos.avg_price * pos.amount + fill_price * amount) / total
+                total = pos.amount + executed_qty
+                pos.avg_price = (pos.avg_price * pos.amount + fill_price * executed_qty) / total
                 pos.amount = total
                 pos.stop_loss, pos.take_profit = stop_loss, take_profit
+                self._refresh_exchange_exits(pos)
             else:
-                session.add(Position(symbol=symbol, avg_price=fill_price, amount=amount,
+                session.add(Position(symbol=symbol, avg_price=fill_price, amount=executed_qty,
                                     side="long" if side == "buy" else "short",
                                     stop_loss=stop_loss, take_profit=take_profit, tp1_hit=False))
 
@@ -267,3 +426,25 @@ class TradingTools:
             log.error(f"execute_trade error: {e}")
             return {"error": str(e)}
         finally: session.close()
+
+    def _cancel_exchange_orders(self, symbol: str):
+        if self.adapter.paper_trading:
+            return
+        try:
+            self.adapter.cancel_all_open_orders(symbol)
+        except Exception as e:
+            log.warning("cancel_all_open_orders failed for %s: %s", symbol, e)
+
+    def _refresh_exchange_exits(self, pos):
+        if self.adapter.paper_trading:
+            return
+        if self.adapter.trading_mode != "futures":
+            return
+        if pos.amount <= 0 or pos.stop_loss <= 0:
+            return
+        try:
+            self.adapter.cancel_all_open_orders(pos.symbol)
+            if pos.take_profit and pos.take_profit > 0:
+                self.adapter.place_exit_orders(pos.symbol, pos.side, pos.amount, pos.stop_loss, pos.take_profit)
+        except Exception as e:
+            log.warning("refresh_exchange_exits failed for %s: %s", pos.symbol, e)

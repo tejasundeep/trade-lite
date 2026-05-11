@@ -45,7 +45,10 @@ class TradingEngine:
         set_market_data(df)
         
         balance = state.get("balance") or self.tools.get_balance()
-        htf_levels = self.tools.get_institutional_levels(symbol)
+        if htf_df_override is not None and not htf_df_override.empty:
+            htf_levels = self.tools.build_institutional_levels(htf_df_override, htf_df_override)
+        else:
+            htf_levels = self.tools.get_institutional_levels(symbol)
         position   = self.tools.get_open_position(symbol)
         
         if position:

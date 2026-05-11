@@ -69,7 +69,7 @@ class BacktestEngine:
 
     async def run_monte_carlo(self, symbol: str, timeframe: str, limit: int = 300, iterations: int = 1000) -> Dict:
         baseline = await self.run(symbol, timeframe, limit)
-        closed = [t for t in baseline.get("trades", []) if t["action"] in {"sell", "stop_loss"}]
+        closed = [t for t in baseline.get("trades", []) if t.get("pnl") is not None]
         pnls = [float(t.get("pnl", 0.0) or 0.0) for t in closed]
         if not pnls:
             return {"error": "Not enough closed trades for Monte Carlo"}
@@ -138,7 +138,7 @@ class BacktestEngine:
                 self.virtual_portfolio["bars_in_position"] += 1
 
         metrics = self._calculate_metrics(equity_curve, trades)
-        closed_trades = [t for t in trades if t["action"] in {"sell", "stop_loss"}]
+        closed_trades = [t for t in trades if t.get("pnl") is not None]
         wins   = len([t for t in closed_trades if t.get("pnl", 0) > 0])
         losses = len([t for t in closed_trades if t.get("pnl", 0) < 0])
         return {
@@ -304,7 +304,7 @@ class BacktestEngine:
         for e in equity_curve:
             peak = max(peak, e)
             max_dd = min(max_dd, (e - peak) / peak if peak else 0)
-        closed = [t for t in trades if t["action"] in {"sell", "stop_loss"}]
+        closed = [t for t in trades if t.get("pnl") is not None]
         pnls    = [float(t.get("pnl", 0.0) or 0.0) for t in closed]
         r_vals  = [float(t.get("r_multiple", 0.0) or 0.0) for t in closed]
         gp = sum(p for p in pnls if p > 0)
@@ -329,7 +329,7 @@ class BacktestEngine:
     def _score_strategy_trades(self, trades: list) -> Dict:
         grouped: Dict[str, list] = {}
         for t in trades:
-            if t.get("action") not in {"sell", "stop_loss"}: continue
+            if t.get("pnl") is None: continue
             grouped.setdefault(t.get("strategy") or "unknown", []).append(t)
         return {
             s: {

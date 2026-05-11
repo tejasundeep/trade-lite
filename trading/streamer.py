@@ -26,6 +26,9 @@ class BinanceStreamer:
         self.symbols_ws = list(self.symbol_map.keys())
 
         self.prices: Dict[str, float] = {s: 0.0 for s in symbols}
+        self.last_price_update: Dict[str, float] = {s: 0.0 for s in symbols}
+        self.last_trade_update: Dict[str, float] = {s: 0.0 for s in symbols}
+        self.last_book_update: Dict[str, float] = {s: 0.0 for s in symbols}
         self.trades: Dict[str, deque] = {s: deque(maxlen=2000) for s in symbols}
         self.orderbook: Dict[str, dict] = {
             s: {"bid": None, "ask": None, "bids": [], "asks": []} for s in symbols
@@ -82,6 +85,8 @@ class BinanceStreamer:
         is_buyer_maker = bool(data["m"])
 
         self.prices[orig_symbol] = price
+        self.last_trade_update[orig_symbol] = time.time()
+        self.last_price_update[orig_symbol] = self.last_trade_update[orig_symbol]
 
         trade = {
             "timestamp": ts,
@@ -121,10 +126,15 @@ class BinanceStreamer:
 
         if bid > 0 and ask > 0:
             self.prices[orig_symbol] = (bid + ask) / 2.0
+            self.last_price_update[orig_symbol] = time.time()
+            self.last_book_update[orig_symbol] = self.last_price_update[orig_symbol]
 
     def _normalize_account_event(self, payload: dict) -> Optional[dict]:
         event = payload.get("event") if isinstance(payload.get("event"), dict) else payload
-        event_type = event.get("e")
+        if not isinstance(event, dict):
+            return None
+
+        event_type = event.get("e") or event.get("event")
         if not event_type:
             return None
 
@@ -139,6 +149,17 @@ class BinanceStreamer:
                 {"asset": b["a"], "free": float(b["f"]), "locked": float(b["l"])}
                 for b in event.get("B", [])
             ]
+        elif event_type == "ACCOUNT_UPDATE":
+            balances = []
+            for b in event.get("a", {}).get("B", []):
+                balances.append(
+                    {
+                        "asset": b.get("a"),
+                        "free": float(b.get("wb", 0.0)),
+                        "locked": 0.0,
+                    }
+                )
+            update["balances"] = balances
         elif event_type == "balanceUpdate":
             update["balance_update"] = {
                 "asset": event.get("a"),
@@ -157,6 +178,23 @@ class BinanceStreamer:
                 "last_filled_price": float(event.get("L", 0.0)),
                 "commission": float(event.get("n", 0.0)),
                 "commission_asset": event.get("N"),
+            }
+        elif event_type == "ORDER_TRADE_UPDATE":
+            order = event.get("o", {})
+            update["order"] = {
+                "symbol": self.symbol_map.get(order.get("s", "").lower(), order.get("s")),
+                "side": order.get("S", "").lower(),
+                "status": order.get("X"),
+                "type": order.get("o"),
+                "price": float(order.get("p", 0.0)),
+                "amount": float(order.get("q", 0.0)),
+                "filled": float(order.get("z", 0.0)),
+                "last_filled_price": float(order.get("L", 0.0)),
+                "avg_price": float(order.get("ap", 0.0)),
+                "reduce_only": bool(order.get("R", False)),
+                "position_side": order.get("ps"),
+                "commission": float(order.get("n", 0.0)),
+                "commission_asset": order.get("N"),
             }
         elif event_type == "externalLockUpdate":
             update["external_lock"] = {
@@ -180,6 +218,97 @@ class BinanceStreamer:
                     cb(update)
             except Exception as e:
                 log.error("Account callback error: %s", e)
+
+    async def _listen_spot_user_data(self):
+        url = getattr(self.adapter, "ws_api_url", "wss://ws-api.binance.com:443/ws-api/v3")
+        retry_delay = 1
+
+        while not self._stop_event.is_set():
+            try:
+                async with websockets.connect(url, ping_interval=None, ping_timeout=None) as ws:
+                    log.info("Spot user data WS API connected: %s", url)
+                    retry_delay = 1
+
+                    ts = int(time.time() * 1000)
+                    subscribe_params = {
+                        "apiKey": self.adapter.api_key,
+                        "timestamp": ts,
+                        "recvWindow": getattr(self.adapter, "recv_window", 5000),
+                    }
+                    subscribe_params["signature"] = self.adapter._signed_request_signature(subscribe_params)
+
+                    subscribe_payload = {
+                        "id": "user-data-subscribe",
+                        "method": "userDataStream.subscribe.signature",
+                        "params": subscribe_params,
+                    }
+                    await ws.send(json.dumps(subscribe_payload))
+
+                    while not self._stop_event.is_set():
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+
+                        if data.get("id") == "user-data-subscribe":
+                            if data.get("status") != 200:
+                                raise RuntimeError(f"User data subscribe failed: {data}")
+                            continue
+
+                        if "event" in data or data.get("e"):
+                            await self._dispatch_account_update(data)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    log.error("Spot user data WebSocket lost: %s. Reconnecting in %ss...", e, retry_delay)
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
+
+    async def _listen_futures_user_data(self):
+        retry_delay = 1
+        keepalive_task = None
+
+        while not self._stop_event.is_set():
+            listen_key = None
+            try:
+                listen_key = self.adapter.get_listen_key()
+                if not listen_key:
+                    log.info("Skipping futures user data stream because listen key could not be created.")
+                    return
+
+                url = f"{getattr(self.adapter, 'ws_user_data_url', 'wss://fstream.binance.com/ws')}/{listen_key}"
+
+                async def _keepalive_loop():
+                    while not self._stop_event.is_set():
+                        await asyncio.sleep(1800)
+                        try:
+                            self.adapter.keep_alive_listen_key(listen_key)
+                        except Exception as exc:
+                            log.warning("Futures listen key refresh failed: %s", exc)
+
+                keepalive_task = asyncio.create_task(_keepalive_loop())
+
+                async with websockets.connect(url, ping_interval=None, ping_timeout=None) as ws:
+                    log.info("Futures user data connected: %s", url)
+                    retry_delay = 1
+
+                    while not self._stop_event.is_set():
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        if data.get("e") in {"ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"}:
+                            await self._dispatch_account_update(data)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    log.error("Futures user data WebSocket lost: %s. Reconnecting in %ss...", e, retry_delay)
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
+            finally:
+                if keepalive_task is not None:
+                    keepalive_task.cancel()
+                    keepalive_task = None
 
     async def _listen_market(self):
         stream_names = []
@@ -221,52 +350,10 @@ class BinanceStreamer:
         if not self.adapter or not getattr(self.adapter, "api_key", None) or not getattr(self.adapter, "secret", None):
             log.info("Skipping Spot user data stream because no API credentials are configured.")
             return
-
-        url = getattr(self.adapter, "ws_api_url", "wss://ws-api.binance.com:443/ws-api/v3")
-        retry_delay = 1
-
-        while not self._stop_event.is_set():
-            try:
-                async with websockets.connect(url, ping_interval=None, ping_timeout=None) as ws:
-                    log.info("User data WS API connected: %s", url)
-                    retry_delay = 1
-
-                    ts = int(time.time() * 1000)
-                    subscribe_params = {
-                        "apiKey": self.adapter.api_key,
-                        "timestamp": ts,
-                        "recvWindow": getattr(self.adapter, "recv_window", 5000),
-                    }
-                    subscribe_params["signature"] = self.adapter._signed_request_signature(subscribe_params)
-
-                    subscribe_payload = {
-                        "id": "user-data-subscribe",
-                        "method": "userDataStream.subscribe.signature",
-                        "params": subscribe_params,
-                    }
-                    await ws.send(json.dumps(subscribe_payload))
-
-                    subscribed = False
-                    while not self._stop_event.is_set():
-                        msg = await ws.recv()
-                        data = json.loads(msg)
-
-                        if data.get("id") == "user-data-subscribe":
-                            subscribed = data.get("status") == 200
-                            if not subscribed:
-                                raise RuntimeError(f"User data subscribe failed: {data}")
-                            continue
-
-                        if "event" in data:
-                            await self._dispatch_account_update(data)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                if not self._stop_event.is_set():
-                    log.error("User data WebSocket lost: %s. Reconnecting in %ss...", e, retry_delay)
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, 60)
+        if getattr(self.adapter, "trading_mode", "spot") == "futures":
+            await self._listen_futures_user_data()
+        else:
+            await self._listen_spot_user_data()
 
     def start(self):
         asyncio.create_task(self._listen_market())
@@ -311,3 +398,10 @@ class BinanceStreamer:
         if not bids or not asks:
             return 0.0
         return float(asks[0][0]) - float(bids[0][0])
+
+    def market_age_seconds(self, symbol: str) -> float:
+        symbol = symbol if symbol in self.last_price_update else self.symbol_map.get(symbol.lower().replace("/", ""), symbol)
+        ts = self.last_price_update.get(symbol, 0.0)
+        if ts <= 0:
+            return float("inf")
+        return max(time.time() - ts, 0.0)

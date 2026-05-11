@@ -14,6 +14,8 @@ from rich import box
 
 from engine.tools import TradingTools
 from engine.engine import TradingEngine
+from engine.backtester import BacktestEngine
+from engine.safety import TradingCircuitBreaker, TradingSafetyConfig, StrategyValidationGate
 from trading.risk import MarketRiskManager, MarketRiskConfig
 from db import init_db
 
@@ -35,12 +37,20 @@ class TradeXProClone:
     def __init__(self):
         key = os.getenv("BINANCE_API_KEY", "").strip()
         log.info(f"Initializing with API Key: {key[:4]}...{key[-4:] if len(key)>4 else ''}")
+        trading_mode = os.getenv("TRADING_MODE", "futures").strip().lower()
+        leverage = int(os.getenv("FUTURES_LEVERAGE", "3"))
+        margin_type = os.getenv("MARGIN_TYPE", "ISOLATED").strip().upper()
+        position_mode = os.getenv("POSITION_MODE", "ONE_WAY").strip().upper()
         
         self.tools = TradingTools(
             api_key=key,
             secret=os.getenv("BINANCE_SECRET", "").strip(),
             paper_trading=os.getenv("PAPER_TRADING", "true").lower() == "true",
-            exchange_id=os.getenv("EXCHANGE_ID", "binance").strip()
+            exchange_id=os.getenv("EXCHANGE_ID", "binance").strip(),
+            trading_mode=trading_mode,
+            leverage=leverage,
+            margin_type=margin_type,
+            position_mode=position_mode,
         )
         self.risk = MarketRiskManager(MarketRiskConfig(
             max_risk_per_trade_pct=float(os.getenv("MAX_RISK_PER_TRADE_PCT", 0.015)),
@@ -48,6 +58,7 @@ class TradeXProClone:
             cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", 45))
         ))
         self.engine = TradingEngine(self.tools, self.risk)
+        self.backtester = BacktestEngine(self.engine, self.tools)
         self.symbol = os.getenv("SYMBOL", "BTC/USDT")
         self.symbols = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
         self.streamer = BinanceStreamer(self.symbols, adapter=self.tools.adapter)
@@ -58,9 +69,61 @@ class TradeXProClone:
         self.symbol_states = {s: {"symbol": s, "balance": 0.0, "price": 0.0, "plan": {}, "indicators": {}} for s in self.symbols}
         self.cached_balance = 0.0
         self.last_balance_update = 0
+        self.live_enabled = True
+        self.validation_report = {}
+
+        self.guard = TradingCircuitBreaker(
+            TradingSafetyConfig(
+                max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", "3")),
+                error_cooldown_minutes=int(os.getenv("ERROR_COOLDOWN_MINUTES", "30")),
+                max_daily_drawdown_pct=float(os.getenv("MAX_LIVE_DRAWDOWN_PCT", "3.0")),
+                max_stale_seconds=int(os.getenv("MAX_STALE_SECONDS", "20")),
+                max_spread_bps=float(os.getenv("MAX_ALLOWED_SPREAD_BPS", "15.0")),
+                min_live_balance=float(os.getenv("MIN_LIVE_BALANCE", "0.0")),
+            ),
+            streamer=self.streamer,
+            tools=self.tools,
+        )
+        self.validation_gate = StrategyValidationGate(
+            backtester=self.backtester,
+            symbols=self.symbols,
+            timeframe=os.getenv("TIMEFRAME", "5m"),
+            limit=int(os.getenv("VALIDATION_LIMIT", "400")),
+            train_size=int(os.getenv("VALIDATION_TRAIN_SIZE", "120")),
+            test_size=int(os.getenv("VALIDATION_TEST_SIZE", "60")),
+            step_size=int(os.getenv("VALIDATION_STEP_SIZE", "60")),
+            min_walk_forward_verdict=os.getenv("VALIDATION_MIN_VERDICT", "promote_to_paper_candidate"),
+            max_risk_of_ruin_pct=float(os.getenv("VALIDATION_MAX_ROR_PCT", "5.0")),
+            max_drawdown_pct=float(os.getenv("VALIDATION_MAX_DRAWDOWN_PCT", "20.0")),
+            min_profit_factor=float(os.getenv("VALIDATION_MIN_PROFIT_FACTOR", "1.05")),
+        )
         
         self._trade_lock = asyncio.Lock()
         init_db()
+
+        if self.tools.adapter.trading_mode == "futures" and not self.tools.adapter.paper_trading:
+            for symbol in self.symbols:
+                try:
+                    self.tools.adapter.set_margin_type(symbol, margin_type)
+                    self.tools.adapter.set_leverage(symbol, leverage)
+                except Exception as e:
+                    log.warning("Futures symbol bootstrap skipped for %s: %s", symbol, e)
+
+    async def _bootstrap_validation(self):
+        require_validation = os.getenv("REQUIRE_VALIDATION_ON_STARTUP", "true").lower() == "true"
+        if self.tools.adapter.paper_trading or not require_validation:
+            self.live_enabled = True
+            return
+
+        self.stats["last_action"] = "Running startup validation..."
+        report = await self.validation_gate.run()
+        self.validation_report = report
+        self.live_enabled = bool(report.get("allowed", False))
+        if not self.live_enabled:
+            self.guard.trip("strategy_validation_failed", cooldown_minutes=24 * 365)
+            log.warning("Startup validation failed. Live trading remains disabled.")
+        else:
+            log.info("Startup validation passed. Live trading armed.")
 
     def create_layout(self) -> Layout:
         l = Layout()
@@ -78,9 +141,10 @@ class TradeXProClone:
         inds, plan, htf = state.get("indicators", {}), state.get("plan", {}), state.get("htf_levels", {})
         smc, macro, trend, vol, vwap, of = inds.get("smc", {}), inds.get("macro", {}), inds.get("trend", {}), inds.get("vol", {}), inds.get("vwap", {}), inds.get("order_flow", {})
         price, balance, decision = state.get("price", 0), state.get("balance", 0), state.get("decision", {})
+        execution_mode = os.getenv("TRADING_MODE", "futures").upper()
         mode = "[bold red]LIVE[/]" if os.getenv("PAPER_TRADING", "true").lower() == "false" else "[bold yellow]PAPER[/]"
 
-        layout["header"].update(Panel(f"[bold cyan]TradeX Pro 2.0 (Elite)[/] | [white]{state.get('symbol')}[/] | {mode} | [dim]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/] | Cycle #{self.stats['cycles']}", style="blue"))
+        layout["header"].update(Panel(f"[bold cyan]TradeX Pro 2.0 (Elite)[/] | [white]{state.get('symbol')}[/] | {execution_mode} {mode} | [dim]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/] | Cycle #{self.stats['cycles']}", style="blue"))
         
         mkt = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
         mkt.add_column("", style="dim"); mkt.add_column("", style="bold")
@@ -131,6 +195,8 @@ class TradeXProClone:
         metrics = state.get("performance", {})
         risk.add_row("Win Rate", f"{metrics.get('win_rate', 0)*100:.1f}%"); risk.add_row("Profit Factor", f"{metrics.get('profit_factor', 0):.2f}")
         risk.add_row("Total Trades", f"{metrics.get('total_trades', 0)}"); risk.add_row("Total PnL", self._color_value(metrics.get("total_pnl", 0.0)))
+        risk.add_row("Live Armed", "[green]YES[/]" if self.live_enabled else "[red]NO[/]")
+        risk.add_row("Breaker", "[red]TRIPPED[/]" if self.guard.tripped else "[green]OK[/]")
         layout["risk"].update(Panel(risk, title="[bold]Risk & Performance[/]", border_style="red"))
 
         hist = Table(show_header=True, box=box.SIMPLE, padding=(0, 1))
@@ -144,7 +210,7 @@ class TradeXProClone:
     async def _handle_account_update(self, update: dict):
         """Handle real-time balance and order updates from WebSocket."""
         event = update.get("event")
-        if event in ["outboundAccountPosition", "balanceUpdate", "externalLockUpdate"]:
+        if event in ["outboundAccountPosition", "balanceUpdate", "externalLockUpdate", "ACCOUNT_UPDATE"]:
             for b in update.get("balances", []):
                 if b["asset"] == "USDT":
                     self.cached_balance = b["free"]
@@ -152,7 +218,7 @@ class TradeXProClone:
                     log.info(f"Real-time Balance Update: {self.cached_balance} USDT")
             if event == "balanceUpdate" and "balances" not in update:
                 self.last_balance_update = 0
-        elif event == "executionReport":
+        elif event in ["executionReport", "ORDER_TRADE_UPDATE"]:
             order = update.get("order", {})
             log.info(
                 "Real-time Order Update: %s %s %s at %s",
@@ -189,9 +255,16 @@ class TradeXProClone:
         # Initial state to avoid NameError if loop fails early
         state = {"symbol": self.symbol, "balance": 0.0, "price": 0.0, "indicators": {}, "plan": {}, "htf_levels": {}, "decision": {}, "position": None, "recent_trades": [], "performance": {}, "today_pnl": 0.0, "unrealized_pnl": 0.0}
         
+        await self._bootstrap_validation()
         self.streamer.start()
         log.info("Elite Streamer Started. Warming up local candle buffers...")
         await asyncio.sleep(10)
+
+        try:
+            self.cached_balance = self.tools.get_balance()
+            self.last_balance_update = time.time()
+        except Exception as e:
+            log.warning("Initial balance sync failed: %s", e)
 
         with Live(layout, refresh_per_second=4, screen=False):
             while True:
@@ -212,36 +285,54 @@ class TradeXProClone:
                     
                     balance = self.cached_balance
                     price_map = self.streamer.prices
-                    
-                    # 2. Position Management
-                    async with self._trade_lock:
-                        self.stats["last_action"] = "Managing positions & Trail..."
-                        # Safe extraction of SMC indicators
-                        smc_map = {s: self.symbol_states.get(s, {}).get("indicators", {}).get("smc", {}) for s in self.symbols}
-                        self.tools.manage_open_positions(price_map, atr_map, smc_map) 
-                        
-                    # 3. Scanning Symbols
-                    self.stats["last_action"] = f"Scanning {len(self.symbols)} symbols..."
-                    results = await asyncio.gather(*[self.scan_symbol(s, balance) for s in self.symbols])
-                    candidates = self._correlation_ok([r for r in results if r is not None])
 
-                    # Update ATR Map
-                    for r in results:
-                        if r: atr_map[r["symbol"]] = r["indicators"].get("vol", {}).get("atr", 0)
+                    day_balance = self.tools.get_day_balance_snapshot()
+                    safety = self.guard.evaluate(self.symbols, balance, day_balance)
+                    can_trade = self.live_enabled and safety.get("allowed", True)
+                    if not can_trade:
+                        self.stats["last_action"] = f"Trading paused: {safety.get('reason', 'disabled')}"
 
-                    # 4. Execution Logic
-                    state = self.symbol_states.get(self.symbol, state)
-                    if candidates:
-                        best = max(candidates, key=lambda r: r["decision"]["confidence"] * r["decision"]["expected_r"])
+                    if can_trade:
+                        # 2. Position Management
                         async with self._trade_lock:
-                            self.stats["last_action"] = f"Executing trade on {best['symbol']}..."
-                            final_res = await self.engine.run(best, execute=True, streamer=self.streamer)
-                            self.symbol_states[best['symbol']] = final_res
-                            state = final_res
+                            self.stats["last_action"] = "Managing positions & Trail..."
+                            self.tools.sync_positions_from_exchange(self.symbols)
+                            # Safe extraction of SMC indicators
+                            smc_map = {s: self.symbol_states.get(s, {}).get("indicators", {}).get("smc", {}) for s in self.symbols}
+                            self.tools.manage_open_positions(price_map, atr_map, smc_map)
+                            
+                        # 3. Scanning Symbols
+                        self.stats["last_action"] = f"Scanning {len(self.symbols)} symbols..."
+                        results = await asyncio.gather(*[self.scan_symbol(s, balance) for s in self.symbols])
+                        candidates = self._correlation_ok([r for r in results if r is not None])
+
+                        # Update ATR Map
+                        for r in results:
+                            if r: atr_map[r["symbol"]] = r["indicators"].get("vol", {}).get("atr", 0)
+
+                        # 4. Execution Logic
+                        state = self.symbol_states.get(self.symbol, state)
+                        if candidates:
+                            best = max(candidates, key=lambda r: r["decision"]["confidence"] * r["decision"]["expected_r"])
+                            async with self._trade_lock:
+                                self.stats["last_action"] = f"Executing trade on {best['symbol']}..."
+                                final_res = await self.engine.run(best, execute=True, streamer=self.streamer)
+                                self.symbol_states[best['symbol']] = final_res
+                                state = final_res
+                        else:
+                            state = await self.engine.run(self.symbol_states[self.symbol], execute=False, streamer=self.streamer)
+                            self.symbol_states[self.symbol] = state
+                            atr_map[state["symbol"]] = state["indicators"].get("vol", {}).get("atr", 0)
                     else:
-                        state = await self.engine.run(self.symbol_states[self.symbol], execute=False, streamer=self.streamer)
-                        self.symbol_states[self.symbol] = state
-                        atr_map[state["symbol"]] = state["indicators"].get("vol", {}).get("atr", 0)
+                        state = self.symbol_states.get(self.symbol, state)
+                        state["decision"] = state.get("decision", {"action": "hold", "reason": safety.get("reason", "Trading paused")})
+                        state["price"] = price_map.get(state["symbol"], state.get("price", 0))
+                        state["balance"] = balance
+                        state["position"] = self.tools.get_open_position(state["symbol"])
+                        state["recent_trades"] = self.tools.get_recent_trades(5)
+                        state["performance"] = self.tools.get_performance_metrics()
+                        state["today_pnl"] = self.tools.get_todays_realized_pnl()
+                        state["unrealized_pnl"] = self.tools.get_unrealized_pnl(state["symbol"], state["price"])
 
                     # 5. Enrichment for Dashboard
                     state["price"] = price_map.get(state["symbol"], state.get("price", 0))
@@ -256,9 +347,11 @@ class TradeXProClone:
                 except Exception as e:
                     self.stats["last_action"] = f"Error: {str(e)[:40]}"
                     log.exception("Loop error")
+                    self.guard.record_error(e)
                 
                 # Ensure dashboard updates even if logic fails
                 self.update_dashboard(layout, state)
+                self.guard.record_success()
                 dt = time.monotonic() - t0
                 await asyncio.sleep(max(0.5, 3 - dt))
 
