@@ -13,7 +13,11 @@ from indicators.trend_strength import analyze_trend_strength
 from indicators.volatility import analyze_volatility
 from indicators.risk import calculate_risk_parameters
 from indicators.market_context import set_market_data, is_backtest
+from indicators.rsi import calculate_rsi
+from indicators.macd import calculate_macd
+from indicators.bollinger import calculate_bollinger
 from .edge import build_edge_plan
+from .strategies import StrategyOrchestrator
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +26,7 @@ class TradingEngine:
     def __init__(self, tools, risk_manager):
         self.tools        = tools
         self.risk_manager = risk_manager
+        self.orchestrator = StrategyOrchestrator()
 
     @staticmethod
     def _ensure_ema_columns(df):
@@ -144,10 +149,33 @@ class TradingEngine:
             "macro":      macro,
             "trend":      analyze_trend_strength(),
             "vol":        analyze_volatility(),
+            "rsi":        calculate_rsi(),
+            "macd":       calculate_macd(),
+            "bollinger":  calculate_bollinger(),
         }
 
-        # 3. EDGE PLAN
-        plan = build_edge_plan(df, indicators, symbol, htf_levels)
+        # 3. DYNAMIC STRATEGY SELECTION
+        # We scan all available strategies and pick the one with the highest confidence
+        best_signal = self.orchestrator.get_best_signal(df, indicators)
+        
+        if best_signal:
+            plan = {
+                "symbol": symbol,
+                "regime": {"name": "multi_strategy_scanning", "tradable": True},
+                "selected": {
+                    "strategy": best_signal.strategy_name,
+                    "action": best_signal.action,
+                    "confidence": best_signal.confidence,
+                    "entry": best_signal.entry,
+                    "stop_loss": best_signal.stop_loss,
+                    "take_profit": best_signal.take_profit,
+                    "expected_r": (abs(best_signal.take_profit - best_signal.entry) / abs(best_signal.entry - best_signal.stop_loss)) if best_signal.stop_loss and abs(best_signal.entry - best_signal.stop_loss) > 0 else 2.0,
+                    "reason": best_signal.reason
+                },
+                "bias": htf_bias
+            }
+        else:
+            plan = {"symbol": symbol, "regime": "Unknown", "selected": None, "reason": "No strategy found an edge"}
 
         state.update({
             "df": df, "price": price, "balance": balance,

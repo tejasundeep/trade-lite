@@ -496,8 +496,22 @@ class TradeXProClone:
         ind = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
         ind.add_row("ADX", f"{trend.get('adx', 0):.1f}"); ind.add_row("ATR %", f"{vol.get('atr_pct', 0):.2f}%")
         ind.add_row("VWAP Z", f"{vwap.get('z_score', 0):.2f}")
-        ind.add_row("1m Delta", f"{of.get('delta', 0):+.2f}")
+        ind.add_row("1m Delta", f"[bold {'green' if of.get('delta', 0) > 0 else 'red'}]{of.get('delta', 0):+,.2f}[/]")
         ind.add_row("CVD", f"[bold cyan]{of.get('cvd', 0):,.0f}[/]")
+        
+        rsi_val = inds.get("rsi", 50.0)
+        rsi_color = "red" if rsi_val > 70 else "green" if rsi_val < 30 else "white"
+        ind.add_row("RSI (14)", f"[{rsi_color}]{rsi_val:.1f}[/]")
+        
+        macd = inds.get("macd", {})
+        macd_color = "green" if macd.get("hist", 0) > 0 else "red"
+        ind.add_row("MACD Hist", f"[{macd_color}]{macd.get('hist', 0):.4f}[/]")
+        
+        bb = inds.get("bollinger", {})
+        price = state.get("price", 0.0)
+        bb_pos = "Upper" if price > bb.get("upper", 0) else "Lower" if price < bb.get("lower", 0) else "Mid"
+        ind.add_row("BB Zone", f"[cyan]{bb_pos}[/]")
+        
         layout["indicators"].update(Panel(ind, title="[bold]Signal Matrix[/]", border_style="blue"))
 
         pos_data, selected = state.get("position"), plan.get("selected")
