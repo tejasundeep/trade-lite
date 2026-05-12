@@ -61,7 +61,7 @@ class TradingEngine:
     ) -> Dict:
         symbol = state["symbol"]
 
-        # 1. RETRIEVE - Zero Latency Priority
+        # 1. Zero Latency Retrieval
         if df_override is not None:
             df = self._ensure_ema_columns(df_override)
         elif streamer:
@@ -71,9 +71,29 @@ class TradingEngine:
         else:
             df = self._ensure_ema_columns(self.tools.get_market_data(symbol))
 
+        # ROBUSTNESS GATE: Data Freshness Check
+        if df is not None and not df.empty:
+            # Handle different data sources (REST index vs Streamer columns)
+            if "timestamp" in df.columns:
+                last_ts = df["timestamp"].iloc[-1]
+            else:
+                last_ts = df.index[-1]
+            
+            # Convert to float unix seconds regardless of type
+            if hasattr(last_ts, "timestamp"):
+                last_candle_time = last_ts.timestamp()
+            else:
+                # If it's in ms (Binance default), convert to seconds
+                last_candle_time = float(last_ts) / 1000.0 if float(last_ts) > 1e11 else float(last_ts)
+
+            if time.time() - last_candle_time > 60:
+                log.warning("%s data is stale (%ds ago). Skipping cycle.", symbol, int(time.time() - last_candle_time))
+                return {"decision": {"action": "hold", "reason": "Stale data gate"}}
+
         balance = state.get("balance")
         if balance is None:
             balance = self._safe_call("get_balance", 0.0)
+
         if df is None or df.empty or "close" not in df.columns:
             state.update({
                 "df": df if df is not None else None,
@@ -118,7 +138,6 @@ class TradingEngine:
         last_htf_update = state.get("last_htf_update", 0)
         
         # Only update HTF bias every 15 minutes or if missing
-        import time
         if htf_bias == "Neutral" or (time.time() - last_htf_update > 900) or htf_df_override is not None:
             try:
                 if htf_bias_override is not None:
@@ -132,6 +151,7 @@ class TradingEngine:
                     htf_smc  = analyze_smc_structure()
                     htf_bias = htf_smc.get("structure", "Neutral")
                     state["last_htf_update"] = time.time()
+                    state["htf_bias"] = htf_bias
             except Exception as e:
                 if htf_bias_override is None:
                     log.warning("HTF fetch failed: %s", e)
@@ -139,6 +159,12 @@ class TradingEngine:
                 set_market_data(df)   # restore LTF
 
         macro = await get_macro_analysis()
+        
+        # Pre-trade Balance Gate: Don't even try if balance is critically low
+        if balance < 1.0: # Minimum safety floor
+            log.debug("Balance too low ($%.2f) to consider new trades.", balance)
+            state.update({"decision": {"action": "hold", "reason": "Insufficient Balance"}})
+            return state
 
         adapter = getattr(self.tools, "adapter", None)
         indicators = {

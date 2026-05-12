@@ -95,10 +95,19 @@ class TradingCircuitBreaker:
                 except Exception as exc:
                     log.debug("Market age check failed for %s: %s", symbol, exc)
                     stale_symbols.append((symbol, float("inf")))
+            # Grace period for startup (warm-up phase)
+            is_warming_up = (now - self._last_ok) < 120 
+            
             if stale_symbols:
+                # Only trip if we are NOT in the warm-up phase OR if age is truly extreme (> 300s)
                 label = ", ".join(f"{s}:{age:.1f}s" for s, age in stale_symbols[:3])
-                self.trip(f"stale_market_data:{label}")
-                return {"allowed": False, "reason": self.trip_reason, "tripped": True}
+                truly_stale = any(age > 300 for s, age in stale_symbols)
+                
+                if not is_warming_up or truly_stale:
+                    self.trip(f"stale_market_data:{label}")
+                    return {"allowed": False, "reason": self.trip_reason, "tripped": True}
+                else:
+                    log.debug("Streamer warming up: %s", label)
             if toxic_spreads:
                 label = ", ".join(f"{s}:{bps:.1f}bps" for s, bps in toxic_spreads[:3])
                 self.trip(f"toxic_spread:{label}")

@@ -181,6 +181,81 @@ class TradeXProClone:
         self.stats = {"cycles": 0, "last_action": "Initializing..."}
         self.runtime_notice = ""
         
+        # Persistent per-symbol states
+        self.symbol_states = {s: {"symbol": s, "balance": 0.0, "price": 0.0, "plan": {}, "indicators": {}} for s in self.symbols}
+        self.cached_balance = 0.0
+        self.last_balance_update = 0
+        self.live_enabled = True
+        self.validation_report = {}
+        self.validation_status = {"active": False, "symbol": "", "index": 0, "total": 0, "stage": ""}
+        self.validation_started_at = 0.0
+
+        self.guard = TradingCircuitBreaker(
+            TradingSafetyConfig(
+                max_consecutive_errors=_env_int("MAX_CONSECUTIVE_ERRORS", 3),
+                error_cooldown_minutes=_env_int("ERROR_COOLDOWN_MINUTES", 30),
+                max_daily_drawdown_pct=_env_float("MAX_LIVE_DRAWDOWN_PCT", 30.0), # Increased for your small account
+                max_stale_seconds=_env_int("MAX_STALE_SECONDS", 60),
+                max_spread_bps=_env_float("MAX_ALLOWED_SPREAD_BPS", 15.0),
+                min_live_balance=_env_float("MIN_LIVE_BALANCE", 0.0),
+            ),
+            streamer=self.streamer,
+            tools=self.tools,
+        )
+
+        # Start a background watchdog to ensure streamer stays alive in real-time
+        self.validation_gate = StrategyValidationGate(
+            backtester=self.backtester,
+            symbols=self.symbols,
+            timeframe=os.getenv("TIMEFRAME", "5m"),
+            limit=_env_int("VALIDATION_LIMIT", 400),
+            train_size=_env_int("VALIDATION_TRAIN_SIZE", 120),
+            test_size=_env_int("VALIDATION_TEST_SIZE", 60),
+            step_size=_env_int("VALIDATION_STEP_SIZE", 60),
+            min_walk_forward_verdict=os.getenv("VALIDATION_MIN_VERDICT", "promote_to_paper_candidate"),
+            max_risk_of_ruin_pct=_env_float("VALIDATION_MAX_ROR_PCT", 5.0),
+            max_drawdown_pct=_env_float("VALIDATION_MAX_DRAWDOWN_PCT", 20.0),
+            min_profit_factor=_env_float("VALIDATION_MIN_PROFIT_FACTOR", 1.05),
+            progress_callback=self._set_validation_progress,
+        )
+        
+        self._trade_lock = asyncio.Lock()
+        init_db()
+        self.grid_states: Dict[str, dict] = {}
+
+        if self.tools.adapter.trading_mode == "futures" and not self.tools.adapter.paper_trading:
+            if _env_bool("FUTURES_BOOTSTRAP_ON_STARTUP", False):
+                m_type = os.getenv("MARGIN_TYPE", "cross").lower()
+                lev = _env_int("LEVERAGE", 10)
+                for symbol in self.symbols:
+                    try:
+                        self.tools.adapter.set_margin_type(symbol, m_type)
+                        self.tools.adapter.set_leverage(symbol, lev)
+                    except Exception as e:
+                        log.warning("Futures symbol bootstrap skipped for %s: %s", symbol, e)
+            else:
+                log.info("Futures margin/leverage bootstrap is disabled on startup. Set FUTURES_BOOTSTRAP_ON_STARTUP=true to enable it.")
+
+    async def _streamer_watchdog(self):
+        """Monitors the streamer and restarts if it goes silent for 30 seconds."""
+        while True:
+            await asyncio.sleep(10)
+            if not hasattr(self, 'streamer') or not self.streamer:
+                continue
+            
+            # Use the max update time across all tracked symbols
+            last_update = max(self.streamer.last_price_update.values(), default=0)
+            if last_update > 0 and time.time() - last_update > 30:
+                log.warning("Streamer watchdog: No data for 30s. Triggering auto-reconnect...")
+                try:
+                    self.streamer.stop()
+                    await asyncio.sleep(2)
+                    self.streamer.start()
+                except Exception as e:
+                    log.error("Failed to auto-reconnect streamer: %s", e)
+        self.stats = {"cycles": 0, "last_action": "Initializing..."}
+        self.runtime_notice = ""
+        
         # Persistent per-symbol states (caches HTF bias, etc.)
         self.symbol_states = {s: {"symbol": s, "balance": 0.0, "price": 0.0, "plan": {}, "indicators": {}} for s in self.symbols}
         self.cached_balance = 0.0
@@ -223,10 +298,12 @@ class TradeXProClone:
 
         if self.tools.adapter.trading_mode == "futures" and not self.tools.adapter.paper_trading:
             if _env_bool("FUTURES_BOOTSTRAP_ON_STARTUP", False):
+                m_type = os.getenv("MARGIN_TYPE", "cross").lower()
+                lev = _env_int("LEVERAGE", 10)
                 for symbol in self.symbols:
                     try:
-                        self.tools.adapter.set_margin_type(symbol, margin_type)
-                        self.tools.adapter.set_leverage(symbol, leverage)
+                        self.tools.adapter.set_margin_type(symbol, m_type)
+                        self.tools.adapter.set_leverage(symbol, lev)
                     except Exception as e:
                         log.warning("Futures symbol bootstrap skipped for %s: %s", symbol, e)
             else:
@@ -822,6 +899,11 @@ class TradeXProClone:
 
         self.start_health_api()
         self.streamer.start()
+        
+        # Start a background watchdog to ensure streamer stays alive in real-time
+        if self.streamer and self.bot_mode != "backtest":
+            asyncio.create_task(self._streamer_watchdog())
+
         log.info("Elite Streamer Started. Warming up local candle buffers...")
         await asyncio.sleep(2)
         self.stats["last_action"] = "Syncing initial balance..."
@@ -984,28 +1066,35 @@ class TradeXProClone:
                                     self.symbol_states[best['symbol']] = final_res
                                     state = final_res
                             else:
-                                state = await self.engine.run(self.symbol_states[self.symbol], execute=False, streamer=self.streamer)
-                                self.symbol_states[self.symbol] = state
-                                atr_map[state["symbol"]] = state["indicators"].get("vol", {}).get("atr", 0)
+                                safe_sym = self.symbol
+                                state = await self.engine.run(self.symbol_states.get(safe_sym, {}), execute=False, streamer=self.streamer)
+                                self.symbol_states[safe_sym] = state
+                                atr_map[safe_sym] = state.get("indicators", {}).get("vol", {}).get("atr", 0)
                         else:
-                            state = self.symbol_states.get(self.symbol, state)
+                            safe_sym = self.symbol
+                            state = self.symbol_states.get(safe_sym, {})
+                            if not state: 
+                                state = {"symbol": safe_sym, "balance": balance, "price": 0.0, "indicators": {}}
+                            
                             state["decision"] = state.get("decision", {"action": "hold", "reason": safety.get("reason", "Trading paused")})
-                            state["price"] = price_map.get(state["symbol"], state.get("price", 0))
+                            state["symbol"] = safe_sym
+                            state["price"] = price_map.get(safe_sym, state.get("price", 0))
                             state["balance"] = balance
-                            state["position"] = self._safe_tool_call("get_open_position", None, state["symbol"])
+                            state["position"] = self._safe_tool_call("get_open_position", None, safe_sym)
                             state["recent_trades"] = self._safe_tool_call("get_recent_trades", [], 5)
                             state["performance"] = self._safe_tool_call("get_performance_metrics", {})
                             state["today_pnl"] = self._safe_tool_call("get_todays_realized_pnl", 0.0)
-                            state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, state["symbol"], state["price"])
+                            state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, safe_sym, state["price"])
 
                         # 5. Enrichment for Dashboard
-                        state["price"] = price_map.get(state["symbol"], state.get("price", 0))
+                        safe_sym = self.symbol
+                        state["price"] = price_map.get(safe_sym, state.get("price", 0))
                         state["balance"] = balance
-                        state["position"] = self._safe_tool_call("get_open_position", None, state["symbol"])
+                        state["position"] = self._safe_tool_call("get_open_position", None, safe_sym)
                         state["recent_trades"] = self._safe_tool_call("get_recent_trades", [], 5)
                         state["performance"] = self._safe_tool_call("get_performance_metrics", {})
                         state["today_pnl"] = self._safe_tool_call("get_todays_realized_pnl", 0.0)
-                        state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, state["symbol"], state["price"])
+                        state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, safe_sym, state["price"])
 
                         self.stats["last_action"] = "Elite Engine Idle"
                         cycle_ok = True
