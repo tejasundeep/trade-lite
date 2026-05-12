@@ -239,7 +239,7 @@ class TradingTools:
 
                 stop_loss, take_profit = self._current_exit_order_prices(symbol)
                 remote = remote_positions.get(market_symbol)
-                if not positions_snapshot_ok and remote is None:
+                if positions_snapshot_ok or remote is not None:
                     action = self._sync_local_position_snapshot(session, symbol, remote, stop_loss=stop_loss, take_profit=take_profit)
                     summary["symbols"].append(
                         {
@@ -408,6 +408,25 @@ class TradingTools:
                 atr = atr_map.get(pos.symbol, price * 0.01) if price else 0
                 if not price or not atr: continue
                 
+                # 0. Local SL/TP Trigger Check (Safety Fallback)
+                is_sl_hit = (pos.side == "long" and price <= pos.stop_loss) or (pos.side == "short" and price >= pos.stop_loss)
+                is_tp_hit = (pos.side == "long" and price >= pos.take_profit and pos.take_profit > 0) or (pos.side == "short" and price <= pos.take_profit and pos.take_profit > 0)
+                
+                if is_sl_hit or is_tp_hit:
+                    reason = "Local Stop Loss Hit" if is_sl_hit else "Local Take Profit Hit"
+                    log.warning(f"{reason} for {pos.symbol} at {price}. Executing market close.")
+                    m_symbol = self.adapter.get_market_symbol(pos.symbol)
+                    side = "sell" if pos.side == "long" else "buy"
+                    res = self.adapter.place_market_order(m_symbol, side, pos.amount, reduce_only=True, position_side=pos.side.upper())
+                    if not res.get("error"):
+                        session.delete(pos)
+                        session.commit()
+                        self._cancel_exchange_orders(pos.symbol)
+                        log.info(f"Successfully closed {pos.symbol} via {reason}")
+                        continue
+                    else:
+                        log.error(f"Failed to execute local exit for {pos.symbol}: {res.get('error')}")
+
                 risk = abs(pos.avg_price - pos.stop_loss)
                 if risk < (pos.avg_price * 0.0001): continue
                 

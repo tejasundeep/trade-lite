@@ -109,7 +109,7 @@ def calculate_risk_parameters(
 
     # 1. Base Kelly / Flat %
     if total_trades < 30:
-        final_risk_pct = min(0.005, max_risk_per_trade_pct)
+        final_risk_pct = max_risk_per_trade_pct
     else:
         full_kelly     = (historical_win_rate * expected_r - (1 - historical_win_rate)) / expected_r
         safe_kelly     = max(0.0, full_kelly * 0.20)

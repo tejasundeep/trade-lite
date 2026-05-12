@@ -827,7 +827,6 @@ class TradeXProClone:
         self.stats["last_action"] = "Syncing initial balance..."
         self.last_balance_update = time.time()
         balance_task = asyncio.create_task(asyncio.to_thread(self.tools.get_balance))
-        reconcile_task = asyncio.create_task(self._startup_reconcile())
         print(
             "\nTradeLite starting\n"
             f"Mode: {self.bot_mode} | Trading: {getattr(self.tools.adapter, 'trading_mode', 'unknown')} | "
@@ -856,6 +855,9 @@ class TradeXProClone:
                 log.warning("Initial balance sync failed: %s", exc)
             finally:
                 balance_task = None
+        
+        # Start reconciliation only after balance sync settled
+        reconcile_task = asyncio.create_task(self._startup_reconcile())
 
         try:
             with Live(layout, refresh_per_second=4, screen=False):
@@ -971,7 +973,10 @@ class TradeXProClone:
 
                             # 4. Execution Logic
                             state = self.symbol_states.get(self.symbol, state)
-                            if candidates:
+                            open_count = len(self._safe_tool_call("get_open_positions", []))
+                            max_pos = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+
+                            if candidates and open_count < max_pos:
                                 best = max(candidates, key=lambda r: r["decision"]["confidence"] * r["decision"]["expected_r"])
                                 async with self._trade_lock:
                                     self.stats["last_action"] = f"Executing trade on {best['symbol']}..."

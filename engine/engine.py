@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import logging
@@ -283,6 +283,13 @@ class TradingEngine:
     def _execute(self, state: Dict) -> Dict:
         decision = state.get("decision", {})
         if decision.get("action") != "trade":
+            return state
+            
+        # Prevent double-buying within 10 seconds
+        now = time.time()
+        last_trade = getattr(self, "_last_trade_at", 0)
+        if now - last_trade < 10:
+            log.info("Skipping trade: Executed another trade too recently.")
             return state
 
         symbol      = state["symbol"]

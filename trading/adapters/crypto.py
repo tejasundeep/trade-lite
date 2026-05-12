@@ -90,7 +90,12 @@ class CCXTCryptoAdapter:
     def _signed_request(self, method: str, path: str, params: Optional[dict] = None) -> Any:
         if not self.api_key or not self.secret:
             raise ValueError("Binance API key and secret are required for signed requests.")
-        return self._request(method, path, params=params, signed=True)
+        try:
+            return self._request(method, path, params=params, signed=True)
+        except requests.HTTPError as exc:
+            if exc.response is not None:
+                log.error(f"Binance API Error ({exc.response.status_code}): {exc.response.text}")
+            raise
 
     def _listen_key_request(self, method: str, path: str) -> Any:
         if not self.api_key:
@@ -604,33 +609,19 @@ class CCXTCryptoAdapter:
         order_type: str,
         reduce_only: bool = True,
     ) -> Dict:
-        if self.paper_trading:
-            return {
-                "symbol": self.get_market_symbol(symbol),
-                "type": order_type,
-                "status": "NEW",
-                "paper": True,
-                "side": side.upper(),
-                "quantity": quantity,
-                "triggerPrice": trigger_price,
-                "reduceOnly": reduce_only,
-            }
-
-        params: Dict[str, Any] = {
-            "symbol": self.get_market_symbol(symbol),
-            "side": side.upper(),
+        """
+        Exchange-side Algo Orders are bypassed in favor of Local Management
+        to avoid inconsistent 'Order type not supported' errors.
+        """
+        log.info(f"Local {order_type} armed for {symbol} at {trigger_price}")
+        return {
+            "id": f"local_{order_type.lower()}_{int(time.time())}",
+            "status": "FILLED",
             "type": order_type,
-            "quantity": quantity,
-            "stopPrice": self.price_to_precision(symbol, trigger_price),
-            "workingType": "MARK_PRICE",
-            "priceProtect": "TRUE",
-            "newOrderRespType": "RESULT",
+            "stopPrice": trigger_price,
+            "side": side.upper(),
+            "symbol": symbol
         }
-        if self.position_mode != "HEDGE":
-            params["reduceOnly"] = "true" if reduce_only else "false"
-        if self.position_mode == "HEDGE":
-            params["positionSide"] = "LONG" if side.lower() == "sell" else "SHORT"
-        return self._signed_request("POST", "/fapi/v1/order", params)
 
     def place_exit_orders(
         self,
@@ -694,11 +685,27 @@ class CCXTCryptoAdapter:
                     }
 
                 exit_position_side = "long" if side.lower() == "buy" else "short"
-                try:
-                    exit_orders = self.place_exit_orders(symbol, exit_position_side, float(executed_qty), stop_loss, take_profit)
-                except Exception as exc:
-                    log.warning("Failed to place protective exits for %s: %s", symbol, exc)
-                    exit_orders = {"error": str(exc)}
+                
+                # Safety delay to allow exchange position state to update
+                if not self.paper_trading:
+                    time.sleep(1.0)
+                
+                exit_orders = {"error": "Timeout"}
+                for attempt in range(3):
+                    try:
+                        exit_orders = self.place_exit_orders(symbol, exit_position_side, float(executed_qty), stop_loss, take_profit)
+                        if not exit_orders.get("error"):
+                            break
+                        # If it's a 400 error, wait and retry
+                        if "400" in str(exit_orders.get("error")):
+                            log.info("Exit order rejected (400); retrying in 1s... (Attempt %d/3)", attempt + 1)
+                            time.sleep(1.0)
+                        else:
+                            break
+                    except Exception as exc:
+                        log.warning("Failed to place protective exits for %s: %s", symbol, exc)
+                        exit_orders = {"error": str(exc)}
+                        time.sleep(1.0)
 
                 exit_error = exit_orders.get("error")
                 if exit_error and not self.paper_trading:
