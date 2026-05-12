@@ -399,13 +399,17 @@ class TradingTools:
 
     def manage_open_positions(self, prices: Dict[str, float], atr_map: Dict[str, float], smc_map: Dict[str, Dict] = None):
         """Scale out at 1:1 R/R, move SL to breakeven+, and trail the remainder structurally."""
+        log.info("Starting manage_open_positions DB session...")
         session = get_session()
         smc_map = smc_map or {}
         try:
+            log.info("Querying local positions...")
             positions = session.query(Position).all()
+            log.info(f"Processing {len(positions)} local positions...")
             for pos in positions:
                 price = prices.get(pos.symbol)
                 atr = atr_map.get(pos.symbol, price * 0.01) if price else 0
+                log.info(f"Checking {pos.symbol}: price={price} atr={atr}")
                 if not price or not atr: continue
                 
                 # 0. Local SL/TP Trigger Check (Safety Fallback)

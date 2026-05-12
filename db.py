@@ -44,7 +44,41 @@ engine  = create_engine("sqlite:///trading.db", connect_args={"check_same_thread
 Session = sessionmaker(bind=engine)
 
 def init_db():
+    from sqlalchemy import event, text
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
     Base.metadata.create_all(engine)
+    
+    # Manual Migration for missing columns
+    session = Session()
+    try:
+        # Check and add tp1_hit
+        try:
+            session.execute(text("SELECT tp1_hit FROM positions LIMIT 1"))
+        except Exception:
+            session.rollback()
+            session.execute(text("ALTER TABLE positions ADD COLUMN tp1_hit BOOLEAN DEFAULT 0"))
+            session.commit()
+            print("Migration: Added tp1_hit to positions")
+
+        # Check and add trailing_stop_price
+        try:
+            session.execute(text("SELECT trailing_stop_price FROM positions LIMIT 1"))
+        except Exception:
+            session.rollback()
+            session.execute(text("ALTER TABLE positions ADD COLUMN trailing_stop_price FLOAT"))
+            session.commit()
+            print("Migration: Added trailing_stop_price to positions")
+            
+    except Exception as e:
+        print(f"Migration warning: {e}")
+        session.rollback()
+    finally:
+        session.close()
 
 def get_session():
     return Session()

@@ -66,7 +66,7 @@ class TradingEngine:
             df = self._ensure_ema_columns(df_override)
         elif streamer:
             df = streamer.get_candles(symbol)
-            if df.empty: df = self.tools.get_market_data(symbol)
+            if df.empty: df = self.tools.get_market_data(symbol, timeframe="1m")
             df = self._ensure_ema_columns(df)
         else:
             df = self._ensure_ema_columns(self.tools.get_market_data(symbol))
@@ -86,9 +86,11 @@ class TradingEngine:
                 # If it's in ms (Binance default), convert to seconds
                 last_candle_time = float(last_ts) / 1000.0 if float(last_ts) > 1e11 else float(last_ts)
 
-            if time.time() - last_candle_time > 60:
+            if time.time() - last_candle_time > 180:
                 log.warning("%s data is stale (%ds ago). Skipping cycle.", symbol, int(time.time() - last_candle_time))
-                return {"decision": {"action": "hold", "reason": "Stale data gate"}}
+                state.update({"decision": {"action": "hold", "reason": "Stale data gate"}})
+                return state
+
 
         balance = state.get("balance")
         if balance is None:

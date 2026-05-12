@@ -93,6 +93,7 @@ class BinanceStreamer:
         ts = int(data["T"])
         is_buyer_maker = bool(data["m"])
 
+        log.info("Trade received for %s: %s", orig_symbol, price)
         self.prices[orig_symbol] = price
         self.last_trade_update[orig_symbol] = time.time()
         self.last_price_update[orig_symbol] = self.last_trade_update[orig_symbol]
@@ -366,13 +367,18 @@ class BinanceStreamer:
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(url, ping_interval=None, ping_timeout=None) as ws:
-                    log.info("Market stream connected: %s", url)
+                    log.info("Market stream connected to %s", url.split('?')[0])
+                    log.debug("Full Stream URL: %s", url)
                     retry_delay = 1
+                    last_msg_at = time.time()
 
                     while not self._stop_event.is_set():
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                            last_msg_at = time.time()
                         except asyncio.TimeoutError:
+                            if time.time() - last_msg_at > 30:
+                                log.warning("Market stream silent for 30s. Connection may be dead.")
                             continue
                         data = json.loads(msg)
                         stream = data.get("stream", "")

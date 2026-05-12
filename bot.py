@@ -182,7 +182,15 @@ class TradeXProClone:
         self.runtime_notice = ""
         
         # Persistent per-symbol states
-        self.symbol_states = {s: {"symbol": s, "balance": 0.0, "price": 0.0, "plan": {}, "indicators": {}} for s in self.symbols}
+        self.symbol_states = {}
+        for s in self.symbols:
+            try:
+                ticker = self.tools.adapter.get_ticker(s)
+                price = float(ticker.get("price", 0.0) or 0.0)
+            except Exception:
+                price = 0.0
+            self.symbol_states[s] = {"symbol": s, "balance": 0.0, "price": price, "plan": {}, "indicators": {}}
+        
         self.cached_balance = 0.0
         self.last_balance_update = 0
         self.live_enabled = True
@@ -245,69 +253,23 @@ class TradeXProClone:
             
             # Use the max update time across all tracked symbols
             last_update = max(self.streamer.last_price_update.values(), default=0)
-            if last_update > 0 and time.time() - last_update > 30:
-                log.warning("Streamer watchdog: No data for 30s. Triggering auto-reconnect...")
+            
+            # Watchdog triggers if:
+            # 1. We had data and it stopped for > 30s
+            # 2. We NEVER had data and it's been > 60s since watchdog started
+            has_timeout = last_update > 0 and (time.time() - last_update > 30)
+            never_connected = last_update == 0 and (self.stats.get("cycles", 0) > 5) # Cycles are ~3-5s each
+            
+            if has_timeout or never_connected:
+                reason = "No data for 30s" if has_timeout else "Failed to connect after startup"
+                log.warning(f"Streamer watchdog: {reason}. Triggering auto-reconnect...")
                 try:
                     self.streamer.stop()
                     await asyncio.sleep(2)
                     self.streamer.start()
                 except Exception as e:
                     log.error("Failed to auto-reconnect streamer: %s", e)
-        self.stats = {"cycles": 0, "last_action": "Initializing..."}
-        self.runtime_notice = ""
-        
-        # Persistent per-symbol states (caches HTF bias, etc.)
-        self.symbol_states = {s: {"symbol": s, "balance": 0.0, "price": 0.0, "plan": {}, "indicators": {}} for s in self.symbols}
-        self.cached_balance = 0.0
-        self.last_balance_update = 0
-        self.live_enabled = True
-        self.validation_report = {}
-        self.validation_status = {"active": False, "symbol": "", "index": 0, "total": 0, "stage": ""}
-        self.validation_started_at = 0.0
 
-        self.guard = TradingCircuitBreaker(
-            TradingSafetyConfig(
-                max_consecutive_errors=_env_int("MAX_CONSECUTIVE_ERRORS", 3),
-                error_cooldown_minutes=_env_int("ERROR_COOLDOWN_MINUTES", 30),
-                max_daily_drawdown_pct=_env_float("MAX_LIVE_DRAWDOWN_PCT", 3.0),
-                max_stale_seconds=_env_int("MAX_STALE_SECONDS", 20),
-                max_spread_bps=_env_float("MAX_ALLOWED_SPREAD_BPS", 15.0),
-                min_live_balance=_env_float("MIN_LIVE_BALANCE", 0.0),
-            ),
-            streamer=self.streamer,
-            tools=self.tools,
-        )
-        self.validation_gate = StrategyValidationGate(
-            backtester=self.backtester,
-            symbols=self.symbols,
-            timeframe=os.getenv("TIMEFRAME", "5m"),
-            limit=_env_int("VALIDATION_LIMIT", 400),
-            train_size=_env_int("VALIDATION_TRAIN_SIZE", 120),
-            test_size=_env_int("VALIDATION_TEST_SIZE", 60),
-            step_size=_env_int("VALIDATION_STEP_SIZE", 60),
-            min_walk_forward_verdict=os.getenv("VALIDATION_MIN_VERDICT", "promote_to_paper_candidate"),
-            max_risk_of_ruin_pct=_env_float("VALIDATION_MAX_ROR_PCT", 5.0),
-            max_drawdown_pct=_env_float("VALIDATION_MAX_DRAWDOWN_PCT", 20.0),
-            min_profit_factor=_env_float("VALIDATION_MIN_PROFIT_FACTOR", 1.05),
-            progress_callback=self._set_validation_progress,
-        )
-        
-        self._trade_lock = asyncio.Lock()
-        init_db()
-        self.grid_states: Dict[str, dict] = {}
-
-        if self.tools.adapter.trading_mode == "futures" and not self.tools.adapter.paper_trading:
-            if _env_bool("FUTURES_BOOTSTRAP_ON_STARTUP", False):
-                m_type = os.getenv("MARGIN_TYPE", "cross").lower()
-                lev = _env_int("LEVERAGE", 10)
-                for symbol in self.symbols:
-                    try:
-                        self.tools.adapter.set_margin_type(symbol, m_type)
-                        self.tools.adapter.set_leverage(symbol, lev)
-                    except Exception as e:
-                        log.warning("Futures symbol bootstrap skipped for %s: %s", symbol, e)
-            else:
-                log.info("Futures margin/leverage bootstrap is disabled on startup. Set FUTURES_BOOTSTRAP_ON_STARTUP=true to enable it.")
 
     async def _bootstrap_validation(self):
         require_validation = _env_bool("REQUIRE_VALIDATION_ON_STARTUP", True)
@@ -941,16 +903,20 @@ class TradeXProClone:
         # Start reconciliation only after balance sync settled
         reconcile_task = asyncio.create_task(self._startup_reconcile())
 
+        log.info("Starting dashboard rendering...")
         try:
             with Live(layout, refresh_per_second=4, screen=False):
+                log.info("Dashboard rendering started. Entering main loop...")
                 waiting_logged = False
                 validation_grace_seconds = _env_int("VALIDATION_STARTUP_GRACE_SECONDS", 15)
                 while True:
                     t0 = time.monotonic()
                     cycle_ok = False
+                    log.info("Main loop cycle starting...")
                     try:
                         self.stats["cycles"] += 1
                         if balance_task is not None and balance_task.done():
+                            log.info("Checkpoint: balance_task finishing...")
                             try:
                                 self.cached_balance = float(balance_task.result() or 0.0)
                                 self.last_balance_update = time.time()
@@ -964,6 +930,7 @@ class TradeXProClone:
                                 balance_task = None
 
                         if reconcile_task is not None and reconcile_task.done():
+                            log.info("Checkpoint: reconcile_task finishing...")
                             try:
                                 await reconcile_task
                             except Exception as exc:
@@ -988,11 +955,11 @@ class TradeXProClone:
                             state["balance"] = self.cached_balance
                             state["price"] = self.streamer.prices.get(self.symbol, 0.0)
                             state["decision"] = {"action": "hold", "reason": "Waiting for initial balance sync"}
-                            state["position"] = self._safe_tool_call("get_open_position", None, self.symbol)
-                            state["recent_trades"] = self._safe_tool_call("get_recent_trades", [], 5)
-                            state["performance"] = self._safe_tool_call("get_performance_metrics", {})
-                            state["today_pnl"] = self._safe_tool_call("get_todays_realized_pnl", 0.0)
-                            state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, self.symbol, state["price"])
+                            state["position"] = await asyncio.to_thread(self._safe_tool_call, "get_open_position", None, self.symbol)
+                            state["recent_trades"] = await asyncio.to_thread(self._safe_tool_call, "get_recent_trades", [], 5)
+                            state["performance"] = await asyncio.to_thread(self._safe_tool_call, "get_performance_metrics", {})
+                            state["today_pnl"] = await asyncio.to_thread(self._safe_tool_call, "get_todays_realized_pnl", 0.0)
+                            state["unrealized_pnl"] = await asyncio.to_thread(self._safe_tool_call, "get_unrealized_pnl", 0.0, self.symbol, state["price"])
                             self.stats["last_action"] = "Waiting for initial balance sync..."
                             self.update_dashboard(layout, state)
                             dt = time.monotonic() - t0
@@ -1002,6 +969,7 @@ class TradeXProClone:
                         # 1. Real-time Balance is handled via callbacks.
                         # We only poll as a fallback if the stream hasn't updated in 5 minutes.
                         if self.cached_balance > 0 and time.time() - self.last_balance_update > 300:
+                            log.info("Checkpoint: Balance update poll...")
                             try:
                                 self.cached_balance = self.tools.get_balance()
                                 self.last_balance_update = time.time()
@@ -1012,19 +980,24 @@ class TradeXProClone:
 
                         balance = self.cached_balance
                         if balance <= 0:
+                            log.info("Checkpoint: Balance missing...")
                             self.stats["last_action"] = "Waiting for balance data..."
                             state["symbol"] = self.symbol
                             state["balance"] = balance
                             state["price"] = self.streamer.prices.get(self.symbol, 0.0)
                             state["decision"] = {"action": "hold", "reason": "Balance unavailable"}
+                            # Use current state values to avoid blocking enrichment if balance is missing
                             self.update_dashboard(layout, state)
                             dt = time.monotonic() - t0
                             await asyncio.sleep(max(0.5, 3 - dt))
                             continue
 
                         price_map = self.streamer.prices
+                        atr_map = {} # Defined earlier or computed
 
-                        day_balance = self.tools.get_day_balance_snapshot()
+                        log.info("Checkpoint: DB Snapshot...")
+                        day_balance = await asyncio.to_thread(self.tools.get_day_balance_snapshot)
+                        log.info("Checkpoint: Safety Evaluate...")
                         safety = self.guard.evaluate(self.symbols, balance, day_balance)
                         can_trade = self.live_enabled and safety.get("allowed", True)
                         if not can_trade:
@@ -1036,12 +1009,14 @@ class TradeXProClone:
                                 self.stats["last_action"] = "Managing positions & Trail..."
                                 now = time.time()
                                 if now - self.last_reconcile_at >= self.reconcile_interval_seconds:
-                                    reconcile_report = self.tools.reconcile_execution_state(self.symbols)
+                                    log.info("Checkpoint: Periodic Reconcile...")
+                                    reconcile_report = await asyncio.to_thread(self.tools.reconcile_execution_state, self.symbols)
                                     self.last_reconcile_at = now
                                     self.stats["last_action"] = f"Reconciled {len(reconcile_report.get('symbols', []))} symbols"
                                 # Safe extraction of SMC indicators
                                 smc_map = {s: self.symbol_states.get(s, {}).get("indicators", {}).get("smc", {}) for s in self.symbols}
-                                self.tools.manage_open_positions(price_map, atr_map, smc_map)
+                                log.info("Checkpoint: Manage positions...")
+                                await asyncio.to_thread(self.tools.manage_open_positions, price_map, atr_map, smc_map)
 
                             # 3. Scanning Symbols
                             self.stats["last_action"] = f"Scanning {len(self.symbols)} symbols..."
@@ -1055,7 +1030,7 @@ class TradeXProClone:
 
                             # 4. Execution Logic
                             state = self.symbol_states.get(self.symbol, state)
-                            open_count = len(self._safe_tool_call("get_open_positions", []))
+                            open_count = len(await asyncio.to_thread(self._safe_tool_call, "get_open_positions", []))
                             max_pos = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 
                             if candidates and open_count < max_pos:
@@ -1067,8 +1042,13 @@ class TradeXProClone:
                                     state = final_res
                             else:
                                 safe_sym = self.symbol
-                                state = await self.engine.run(self.symbol_states.get(safe_sym, {}), execute=False, streamer=self.streamer)
+                                state = self.symbol_states.get(safe_sym, {})
+                                if not state or "symbol" not in state:
+                                    state = {"symbol": safe_sym, "balance": balance, "price": price_map.get(safe_sym, 0.0), "indicators": {}}
+                                
+                                state = await self.engine.run(state, execute=False, streamer=self.streamer)
                                 self.symbol_states[safe_sym] = state
+
                                 atr_map[safe_sym] = state.get("indicators", {}).get("vol", {}).get("atr", 0)
                         else:
                             safe_sym = self.symbol
@@ -1090,11 +1070,11 @@ class TradeXProClone:
                         safe_sym = self.symbol
                         state["price"] = price_map.get(safe_sym, state.get("price", 0))
                         state["balance"] = balance
-                        state["position"] = self._safe_tool_call("get_open_position", None, safe_sym)
-                        state["recent_trades"] = self._safe_tool_call("get_recent_trades", [], 5)
-                        state["performance"] = self._safe_tool_call("get_performance_metrics", {})
-                        state["today_pnl"] = self._safe_tool_call("get_todays_realized_pnl", 0.0)
-                        state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, safe_sym, state["price"])
+                        state["position"] = await asyncio.to_thread(self._safe_tool_call, "get_open_position", None, safe_sym)
+                        state["recent_trades"] = await asyncio.to_thread(self._safe_tool_call, "get_recent_trades", [], 5)
+                        state["performance"] = await asyncio.to_thread(self._safe_tool_call, "get_performance_metrics", {})
+                        state["today_pnl"] = await asyncio.to_thread(self._safe_tool_call, "get_todays_realized_pnl", 0.0)
+                        state["unrealized_pnl"] = await asyncio.to_thread(self._safe_tool_call, "get_unrealized_pnl", 0.0, safe_sym, state["price"])
 
                         self.stats["last_action"] = "Elite Engine Idle"
                         cycle_ok = True
