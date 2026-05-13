@@ -108,13 +108,28 @@ def calculate_risk_parameters(
         return {"action": "lock", "reason": "System in Cooldown",
                 "unlock_in_seconds": round(lock_until - now)}
 
-    # 1. Base Kelly / Flat %
+    # 1. Dynamic Confidence Scaling (Elite Risk Model)
+    if confidence_score < 0.70:
+        return {
+            "action": "lock",
+            "reason": f"Confidence Below Threshold: {confidence_score:.2f} < 0.70",
+            "recommended_amount": 0.0,
+            "risk_pct": 0.0,
+            "notional_value": 0.0,
+        }
+
+    # Scale risk factor: 0.70 confidence = 50% of max_risk, 1.00 confidence = 100% of max_risk
+    confidence_mult = (confidence_score - 0.70) / 0.30
+    dynamic_scaling = 0.50 + (0.50 * confidence_mult)
+    
     if total_trades < 30:
-        final_risk_pct = max_risk_per_trade_pct
+        # For new bots, use a scaled version of the flat max risk
+        final_risk_pct = max_risk_per_trade_pct * dynamic_scaling
     else:
+        # For established bots, use scaled Kelly Criterion
         full_kelly     = (historical_win_rate * expected_r - (1 - historical_win_rate)) / expected_r
-        safe_kelly     = max(0.0, full_kelly * 0.20)
-        final_risk_pct = min(safe_kelly * confidence_score, max_risk_per_trade_pct)
+        safe_kelly     = max(0.0, full_kelly * 0.25) # Slightly more aggressive for established bots
+        final_risk_pct = min(safe_kelly * dynamic_scaling, max_risk_per_trade_pct * dynamic_scaling)
 
     # 2. Elite Liquidity Adjustment
     # If spread > 10% of the ATR, we are in a low-liquidity environment. Reduce risk.

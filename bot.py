@@ -25,10 +25,11 @@ from engine.safety import TradingCircuitBreaker, TradingSafetyConfig, StrategyVa
 from trading.risk import MarketRiskManager, MarketRiskConfig
 from db import init_db, get_session, Position
 from engine.chatbot import TradingChatbot
+from engine.cache import GlobalAsyncCache
 
 from trading.streamer import BinanceStreamer
 
-load_dotenv()
+load_dotenv(override=True)
 
 from rich.logging import RichHandler
 
@@ -239,6 +240,7 @@ class TradeXProClone:
         self._trade_lock = asyncio.Lock()
         init_db()
         self.grid_states: Dict[str, dict] = {}
+        self.cache = GlobalAsyncCache(self.tools)
 
         if self.tools.adapter.trading_mode == "futures" and not self.tools.adapter.paper_trading:
             if _env_bool("FUTURES_BOOTSTRAP_ON_STARTUP", False):
@@ -852,6 +854,9 @@ class TradeXProClone:
             asyncio.set_event_loop(loop)
             
             async def engine_init():
+                # Start cache background workers
+                await self.cache.start()
+                
                 # Start streamer and balance sync INSIDE the running loop
                 self.streamer.start()
                 balance_task = asyncio.create_task(asyncio.to_thread(self.tools.get_balance))
@@ -860,7 +865,10 @@ class TradeXProClone:
                 await asyncio.sleep(2)
                 
                 # Run the autonomous task
-                await self._autonomous_trading_task(balance_task, None)
+                try:
+                    await self._autonomous_trading_task(balance_task, None)
+                finally:
+                    await self.cache.stop()
 
             loop.run_until_complete(engine_init())
 
@@ -975,8 +983,14 @@ class TradeXProClone:
                         self.symbol_states[best['symbol']] = final_res
 
                 await asyncio.sleep(3) # Elite cycle frequency
+            except asyncio.CancelledError:
+                log.info("Autonomous loop cancelled.")
+                break
+            except ConnectionError as e:
+                log.error(f"Network error in autonomous loop: {e}")
+                await asyncio.sleep(10)
             except Exception as e:
-                log.error(f"Autonomous loop error: {e}")
+                log.error(f"Autonomous loop error: {type(e).__name__}: {e}")
                 await asyncio.sleep(5)
 
 

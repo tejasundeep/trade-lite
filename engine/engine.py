@@ -18,6 +18,7 @@ from indicators.macd import calculate_macd
 from indicators.bollinger import calculate_bollinger
 from .edge import build_edge_plan
 from .strategies import StrategyOrchestrator
+from .cache import GlobalAsyncCache
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class TradingEngine:
         self.tools        = tools
         self.risk_manager = risk_manager
         self.orchestrator = StrategyOrchestrator()
+        self.cache        = GlobalAsyncCache(tools)
 
     @staticmethod
     def _ensure_ema_columns(df):
@@ -45,6 +47,12 @@ class TradingEngine:
             return default
         try:
             return fn(*args, **kwargs)
+        except ConnectionError as exc:
+            log.error("Network error during %s: %s", name, exc)
+            return default
+        except TimeoutError as exc:
+            log.warning("Timeout during %s: %s", name, exc)
+            return default
         except Exception as exc:
             log.debug("%s failed: %s", name, exc)
             return default
@@ -133,34 +141,14 @@ class TradingEngine:
         if position:
             position["unrealized_pnl"] = self._safe_call("get_unrealized_pnl", 0.0, symbol, price)
 
-        # 2. ANALYZE — Optimized HTF bias
-        # Elite Note: HTF structure (1h) doesn't change every 5 seconds. 
-        # We cache it in state to avoid REST call spam.
-        htf_bias = htf_bias_override or state.get("htf_bias", "Neutral")
-        last_htf_update = state.get("last_htf_update", 0)
+        # 2. ANALYZE — Optimized HTF bias and Heavy Indicators
+        # Elite Note: Offload heavy calls to background cache
+        macro = self.cache.get("macro_sentiment")
+        if not macro:
+             # Fallback to sync if cache empty but it's risky
+             macro = await get_macro_analysis()
         
-        # Only update HTF bias every 15 minutes or if missing
-        if htf_bias == "Neutral" or (time.time() - last_htf_update > 900) or htf_df_override is not None:
-            try:
-                if htf_bias_override is not None:
-                    htf_bias = htf_bias_override
-                else:
-                    if htf_df_override is not None:
-                        df_htf = htf_df_override
-                    else:
-                        df_htf = self.tools.get_market_data(symbol, timeframe="1h", limit=200)
-                    set_market_data(df_htf)
-                    htf_smc  = analyze_smc_structure()
-                    htf_bias = htf_smc.get("structure", "Neutral")
-                    state["last_htf_update"] = time.time()
-                    state["htf_bias"] = htf_bias
-            except Exception as e:
-                if htf_bias_override is None:
-                    log.warning("HTF fetch failed: %s", e)
-            finally:
-                set_market_data(df)   # restore LTF
-
-        macro = await get_macro_analysis()
+        htf_bias = htf_bias_override or state.get("htf_bias", "Neutral")
         
         # Pre-trade Balance Gate: Don't even try if balance is critically low
         # 2. ANALYZE — ELITE CACHING GATE
@@ -194,6 +182,8 @@ class TradingEngine:
             "stoch":      stoch_data,
             "macd":       calculate_macd(),
             "bollinger":  calculate_bollinger(),
+            "cross_exchange": self.cache.get(f"cross_exchange_{symbol.split('/')[0]}", self.cache.get("cross_exchange_BTC")),
+            "asset_correlation": self.cache.get("asset_correlation_market"),
         }
 
         # 3. DYNAMIC STRATEGY SELECTION

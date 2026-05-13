@@ -5,9 +5,12 @@ import numpy as np
 import pandas as pd
 import json
 import time
+import logging
 from typing import Dict, Any, List, Optional
 from indicators.market_context import set_market_data, get_market_data, set_backtest, is_backtest
 from db import get_session, SystemState
+
+log = logging.getLogger(__name__)
 
 class BacktestEngine:
     """
@@ -24,10 +27,11 @@ class BacktestEngine:
         self.engine = engine
         self.tools = tools
         self.starting_equity = 10_000.0
-        self.fee_rate = 0.001
-        self.slippage_pct = 0.0005
-        self.spread_pct = 0.0005
-        self.market_depth_usdt = 50_000.0
+        self.maker_fee = 0.0002 # 0.02%
+        self.taker_fee = 0.0005 # 0.05%
+        self.slippage_pct = 0.0003
+        self.spread_pct = 0.0002
+        self.market_depth_usdt = 100_000.0
         self.max_risk_per_trade_pct = 0.015
         self.max_position_pct = 0.20
         self.virtual_portfolio = self._fresh_portfolio()
@@ -139,6 +143,7 @@ class BacktestEngine:
 
                 self._mark_open_trade_excursion(high, low)
                 self._simulate_stop(ts, low, high, trades, price)
+                self._simulate_tp(ts, low, high, trades, price)
 
                 htf_levels, htf_bias = self._historical_htf_context(df, i)
                 state = {
@@ -256,6 +261,7 @@ class BacktestEngine:
 
                 self._mark_open_trade_excursion(high, low)
                 self._simulate_stop(ts, low, high, trades, price)
+                self._simulate_tp(ts, low, high, trades, price)
 
                 htf_levels, htf_bias = self._historical_htf_context(df, i)
                 state = {
@@ -432,12 +438,38 @@ class BacktestEngine:
         p["position"]   = new_amt
         p["side"]        = direction
         p["stop_loss"]   = float(decision.get("stop_loss") or 0)
+        p["take_profit"] = float(decision.get("take_profit") or 0)
         p["entry_risk_per_unit"] = abs(p["avg_price"] - p["stop_loss"])
         p["open_trade_high"] = max(high, fill)
         p["open_trade_low"]  = min(low, fill)
         p["fees_paid"]  += fee
         p["active_strategy"] = decision.get("strategy", "")
         p["active_labels"]   = decision.get("labels", {})
+
+    def _simulate_tp(self, ts, low: float, high: float, trades: list, price: float):
+        p = self.virtual_portfolio
+        if p["position"] <= 0 or p["take_profit"] <= 0: return
+        
+        # ELITE FIDELITY: To fill a Limit TP, price must PASS THROUGH it, or touch it for a long time.
+        # We simulate this by requiring price to touch it.
+        triggered = (p["side"] == "long" and high >= p["take_profit"]) or \
+                    (p["side"] == "short" and low <= p["take_profit"])
+        if not triggered: return
+
+        # Fill at the TP price (Maker)
+        fill = p["take_profit"]
+        fee = p["position"] * fill * self.maker_fee
+        pnl = ((fill - p["avg_price"]) if p["side"] == "long" else (p["avg_price"] - fill)) * p["position"] - fee
+        p["realized_pnl"] += pnl; p["fees_paid"] += fee
+        if p["side"] == "long":  p["free_usdt"] += p["position"] * fill - fee
+        else:                    p["free_usdt"] += p["avg_price"] * p["position"] + pnl
+        
+        r_mult = self._r_multiple(pnl, p["position"])
+        mfe_r, mae_r = self._excursion_r()
+        trades.append({"time": str(ts), "action": "take_profit", "price": fill, "amount": p["position"],
+                        "fee": fee, "pnl": pnl, "r_multiple": r_mult, "mfe_r": mfe_r, "mae_r": mae_r,
+                        "strategy": p["active_strategy"], "reason": "Simulated TP (Maker)"})
+        self._reset_position()
 
     def _reset_position(self):
         p = self.virtual_portfolio
@@ -451,9 +483,13 @@ class BacktestEngine:
         triggered = (p["side"] == "long" and low <= p["stop_loss"]) or \
                     (p["side"] == "short" and high >= p["stop_loss"])
         if not triggered: return
-        fill = self._sell_price(min(p["stop_loss"], low), p["position"]) if p["side"] == "long" else \
-               self._buy_price(max(p["stop_loss"], high), p["position"])
-        fee = p["position"] * fill * self.fee_rate
+        
+        # Stop loss is a Market order (Taker)
+        # Fill is worst case (the stop level or the candle low/high)
+        fill = self._sell_price(min(p["stop_loss"], low), p["position"], force_taker=True) if p["side"] == "long" else \
+               self._buy_price(max(p["stop_loss"], high), p["position"], force_taker=True)
+        
+        fee = p["position"] * fill * self.taker_fee
         pnl = ((fill - p["avg_price"]) if p["side"] == "long" else (p["avg_price"] - fill)) * p["position"] - fee
         p["realized_pnl"] += pnl; p["fees_paid"] += fee
         if p["side"] == "long":  p["free_usdt"] += p["position"] * fill - fee
@@ -462,7 +498,7 @@ class BacktestEngine:
         mfe_r, mae_r = self._excursion_r()
         trades.append({"time": str(ts), "action": "stop_loss", "price": fill, "amount": p["position"],
                         "fee": fee, "pnl": pnl, "r_multiple": r_mult, "mfe_r": mfe_r, "mae_r": mae_r,
-                        "strategy": p["active_strategy"], "reason": "Simulated Stop Loss"})
+                        "strategy": p["active_strategy"], "reason": "Simulated Stop Loss (Taker)"})
         self._reset_position()
 
     def _mark_open_trade_excursion(self, high: float, low: float):
@@ -471,7 +507,7 @@ class BacktestEngine:
         p["open_trade_high"] = max(p["open_trade_high"] or high, high)
         p["open_trade_low"]  = min(p["open_trade_low"] or low, low)
 
-    def _buy_price(self, price: float, amount: float = 0.0) -> float:
+    def _buy_price(self, price: float, amount: float = 0.0, force_taker: bool = False) -> float:
         df = get_market_data()
         atr = price * 0.001
         if df is not None and not df.empty and "close" in df.columns:
@@ -480,10 +516,13 @@ class BacktestEngine:
                 atr = float(atr_val)
         vol_mult = max(1.0, atr / (price * 0.005))
         stochastic = abs(np.random.normal(0, self.slippage_pct * 0.5))
-        impact = (amount * price / self.market_depth_usdt) * 0.01
+        impact = (amount * price / self.market_depth_usdt) * 0.02 # Increased impact for fidelity
+        
+        # If it's a market order or stop, it's a Taker. 
+        # For entries, we assume Taker for pessimism.
         return price * (1 + self.spread_pct / 2 + (self.slippage_pct * vol_mult) + impact + stochastic)
 
-    def _sell_price(self, price: float, amount: float = 0.0) -> float:
+    def _sell_price(self, price: float, amount: float = 0.0, force_taker: bool = False) -> float:
         df = get_market_data()
         atr = price * 0.001
         if df is not None and not df.empty and "close" in df.columns:
@@ -492,7 +531,7 @@ class BacktestEngine:
                 atr = float(atr_val)
         vol_mult = max(1.0, atr / (price * 0.005))
         stochastic = abs(np.random.normal(0, self.slippage_pct * 0.5))
-        impact = (amount * price / self.market_depth_usdt) * 0.01
+        impact = (amount * price / self.market_depth_usdt) * 0.02
         return price * (1 - self.spread_pct / 2 - (self.slippage_pct * vol_mult) - impact - stochastic)
 
     def _cap_buy_amount(self, req: float, price: float, stop_loss) -> float:
