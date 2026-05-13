@@ -620,6 +620,15 @@ class ClimaxReversalStrategy(BaseStrategy):
         return None
 
 class StrategyOrchestrator:
+    """
+    Multi-Strategy Consensus Engine.
+    
+    All strategies are evaluated equally via normalized weights.
+    The final signal is an aggregate of ALL agreeing strategies,
+    not a single "best" pick. This removes bias towards any one
+    strategy family (e.g., SMC).
+    """
+
     def __init__(self):
         self.strategies: List[BaseStrategy] = [
             InstitutionalMomentumStrategy(),
@@ -638,88 +647,256 @@ class StrategyOrchestrator:
             SilverBulletStrategy(),
             EliteSMCStrategy()
         ]
+        self._last_scorecard: Optional[Dict] = None
+
+    @property
+    def last_scorecard(self) -> Optional[Dict]:
+        """Returns the last consensus scorecard for dashboard/logging."""
+        return self._last_scorecard
 
     def get_best_signal(self, df: pd.DataFrame, indicators: Dict) -> Optional[StrategySignal]:
+        """
+        True multi-strategy consensus engine.
+        
+        1. Evaluate all strategies → collect active signals
+        2. Normalize weights so no single strategy dominates
+        3. Compute directional score = Σ(norm_weight × confidence) per side
+        4. Pick direction with higher score
+        5. Apply conflict penalty if the vote is closely split
+        6. Aggregate entry/SL/TP as weighted average of all agreeing signals
+        7. Apply graduated confluence bonus
+        8. Log full scorecard for transparency
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+
         active_signals = []
+        evaluated_strategies = []
+
         for strategy in self.strategies:
             try:
                 signal = strategy.evaluate(df, indicators)
+                evaluated_strategies.append({
+                    "name": strategy.name,
+                    "weight": strategy.weight,
+                    "fired": signal is not None and signal.action in ["buy", "sell"],
+                    "action": signal.action if signal else "none",
+                    "confidence": signal.confidence if signal else 0.0,
+                })
                 if signal and signal.action in ["buy", "sell"]:
-                    # Attach the strategy's weight to the signal for the aggregator
                     signal.strategy_weight = strategy.weight
                     active_signals.append(signal)
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).error(f"Strategy {strategy.name} failed: {e}")
+                _log.error(f"Strategy {strategy.name} failed: {e}")
+                evaluated_strategies.append({
+                    "name": strategy.name, "weight": strategy.weight,
+                    "fired": False, "action": "error", "confidence": 0.0,
+                })
 
         if not active_signals:
+            self._last_scorecard = {
+                "decision": "hold", "reason": "No strategy fired",
+                "strategies": evaluated_strategies,
+            }
             return None
 
-        # --- EXPERT WEIGHTED AGGREGATOR ---
+        # ─── Step 1: Normalize weights ───────────────────────────────────
+        total_weight = sum(s.strategy_weight for s in active_signals)
+        if total_weight <= 0:
+            total_weight = 1.0
+
+        for sig in active_signals:
+            sig._norm_weight = sig.strategy_weight / total_weight
+
+        # ─── Step 2: Directional scoring ─────────────────────────────────
         buy_sigs = [s for s in active_signals if s.action == "buy"]
         sell_sigs = [s for s in active_signals if s.action == "sell"]
-        
-        buy_weight_sum = sum(s.strategy_weight for s in buy_sigs)
-        sell_weight_sum = sum(s.strategy_weight for s in sell_sigs)
-        
-        # Decide direction based on Weight Dominance
-        if buy_weight_sum > sell_weight_sum:
+
+        # Score = sum of (normalized_weight × confidence) for each direction
+        buy_score = sum(s._norm_weight * s.confidence for s in buy_sigs)
+        sell_score = sum(s._norm_weight * s.confidence for s in sell_sigs)
+        total_score = buy_score + sell_score
+
+        # ─── Step 3: Direction decision ──────────────────────────────────
+        if buy_score > sell_score:
             winning_sigs = buy_sigs
-            winning_weight = buy_weight_sum
+            losing_sigs = sell_sigs
+            winning_score = buy_score
+            losing_score = sell_score
             action = "buy"
-        else:
+        elif sell_score > buy_score:
             winning_sigs = sell_sigs
-            winning_weight = sell_weight_sum
+            losing_sigs = buy_sigs
+            winning_score = sell_score
+            losing_score = buy_score
             action = "sell"
+        else:
+            # Perfect tie — hold
+            self._last_scorecard = {
+                "decision": "hold", "reason": "Exact directional tie",
+                "buy_score": round(buy_score, 4), "sell_score": round(sell_score, 4),
+                "strategies": evaluated_strategies,
+            }
+            return None
 
-        # Calculate Mathematically Weighted Average Confidence
-        # Formula: (Sum of Confidence * Weight) / Sum of Weights
-        weighted_conf_sum = sum(s.confidence * s.strategy_weight for s in winning_sigs)
-        avg_confidence = weighted_conf_sum / winning_weight
-        
-        # Confluence Multiplier: 
-        # Boost starts at 2 agreeing strategies for higher frequency
-        if len(winning_sigs) >= 2:
-            avg_confidence = min(0.99, avg_confidence * 1.15)
+        # ─── Step 4: Consensus strength & conflict penalty ───────────────
+        # Directional agreement = winning_score / total_score
+        agreement_ratio = winning_score / total_score if total_score > 0 else 0.0
 
-        # Pick the most authoritative strategy as the primary metadata source
-        best_signal = max(winning_sigs, key=lambda x: x.strategy_weight)
-        best_signal.confidence = avg_confidence
-        
-        # --- EXECUTION FILTERS (Optimized for 5m Frequency) ---
+        # Require >55% directional agreement (not a coin flip)
+        if agreement_ratio < 0.55:
+            self._last_scorecard = {
+                "decision": "hold",
+                "reason": f"Weak consensus: {agreement_ratio:.0%} agreement ({action})",
+                "buy_score": round(buy_score, 4), "sell_score": round(sell_score, 4),
+                "agreement": round(agreement_ratio, 4),
+                "strategies": evaluated_strategies,
+            }
+            return None
+
+        # Base consensus confidence = weighted average of winning signals' confidence
+        winning_weight_sum = sum(s.strategy_weight for s in winning_sigs)
+        consensus_confidence = (
+            sum(s.confidence * s.strategy_weight for s in winning_sigs) / winning_weight_sum
+            if winning_weight_sum > 0 else 0.0
+        )
+
+        # Conflict penalty: reduce confidence when opposing signals exist
+        if losing_score > 0:
+            conflict_ratio = losing_score / winning_score  # 0.0 = no conflict, 1.0 = tied
+            conflict_penalty = conflict_ratio * 0.15  # Max 15% penalty
+            consensus_confidence *= (1.0 - conflict_penalty)
+
+        # ─── Step 5: Graduated confluence bonus ──────────────────────────
+        # +3% per additional agreeing strategy (beyond the first), capped at +15%
+        num_agreeing = len(winning_sigs)
+        if num_agreeing >= 2:
+            confluence_bonus = min(0.15, (num_agreeing - 1) * 0.03)
+            consensus_confidence = min(0.99, consensus_confidence * (1.0 + confluence_bonus))
+
+        # ─── Step 6: Aggregate entry/SL/TP via weighted average ──────────
+        # All agreeing strategies contribute to the final levels
+        agg_entry = 0.0
+        agg_sl = 0.0
+        agg_tp = 0.0
+        w_sum = 0.0
+
+        for sig in winning_sigs:
+            w = sig.strategy_weight * sig.confidence  # Weight by both strategy weight AND confidence
+            if sig.entry and sig.stop_loss and sig.take_profit:
+                agg_entry += sig.entry * w
+                agg_sl += sig.stop_loss * w
+                agg_tp += sig.take_profit * w
+                w_sum += w
+
+        if w_sum > 0:
+            agg_entry /= w_sum
+            agg_sl /= w_sum
+            agg_tp /= w_sum
+        else:
+            # Fallback to highest-confidence signal
+            best = max(winning_sigs, key=lambda x: x.confidence)
+            agg_entry = best.entry
+            agg_sl = best.stop_loss
+            agg_tp = best.take_profit
+
+        # Build the reason string showing which strategies agreed
+        strategy_names = [s.strategy_name for s in winning_sigs]
+        primary_reason = max(winning_sigs, key=lambda x: x.confidence * x.strategy_weight).reason
+
+        # ─── Step 7: Build consensus signal ──────────────────────────────
+        consensus_signal = StrategySignal(
+            strategy_name=f"CONSENSUS ({num_agreeing}/{len(active_signals)} strategies)",
+            action=action,
+            confidence=round(consensus_confidence, 4),
+            entry=round(agg_entry, 8),
+            stop_loss=round(agg_sl, 8),
+            take_profit=round(agg_tp, 8),
+            reason=primary_reason,
+        )
+        consensus_signal.strategy_weight = winning_weight_sum  # For downstream compatibility
+
+        # ─── Step 8: Execution filters ───────────────────────────────────
         price = float(df.iloc[-1]["close"])
-        vol = indicators.get("vol", {})
-        spread_bps = indicators.get("spread_bps", 3.0) 
-        
-        cost_impact = (spread_bps / 10000) * price
-        expected_profit = abs(best_signal.take_profit - best_signal.entry)
-        
-        if cost_impact > expected_profit * 0.20:
-            return None # Relaxed cost threshold to 20%
+        spread_bps = indicators.get("spread_bps", 3.0)
 
-        # Macro Sentiment Filter (Relaxed to 0.85x)
+        cost_impact = (spread_bps / 10000) * price
+        expected_profit = abs(consensus_signal.take_profit - consensus_signal.entry)
+
+        if expected_profit > 0 and cost_impact > expected_profit * 0.20:
+            self._last_scorecard = {
+                "decision": "hold", "reason": "Cost impact too high vs expected profit",
+                "cost_bps": round(spread_bps, 2), "strategies": evaluated_strategies,
+            }
+            return None
+
+        # Macro Sentiment Filter
         macro = indicators.get("macro", {})
         sentiment = macro.get("sentiment", {}).get("score", 50)
         liquidity = indicators.get("liquidity", {})
-        
+
         if (sentiment < 20 and action == "sell") or (sentiment > 80 and action == "buy"):
-            best_signal.confidence *= 0.85
-            
-        # Dynamic Liquidity
+            consensus_signal.confidence *= 0.85
+
+        # Dynamic Liquidity Targets
         if action == "buy":
             targets = liquidity.get("buy_side_liquidity_targets", [])
             if targets:
-                valid_targets = [t for t in targets if t > best_signal.entry]
-                if valid_targets: best_signal.take_profit = min(valid_targets)
+                valid_targets = [t for t in targets if t > consensus_signal.entry]
+                if valid_targets:
+                    consensus_signal.take_profit = min(valid_targets)
         elif action == "sell":
             targets = liquidity.get("sell_side_liquidity_targets", [])
             if targets:
-                valid_targets = [t for t in targets if t < best_signal.entry]
-                if valid_targets: best_signal.take_profit = max(valid_targets)
-        
-        # Final Expert Gate (Adjusted to 0.75 for optimal balance)
-        if best_signal.confidence < 0.75:
+                valid_targets = [t for t in targets if t < consensus_signal.entry]
+                if valid_targets:
+                    consensus_signal.take_profit = max(valid_targets)
+
+        # Final confidence gate
+        if consensus_signal.confidence < 0.75:
+            self._last_scorecard = {
+                "decision": "hold",
+                "reason": f"Consensus confidence {consensus_signal.confidence:.2%} below 75% gate",
+                "buy_score": round(buy_score, 4), "sell_score": round(sell_score, 4),
+                "agreement": round(agreement_ratio, 4),
+                "strategies": evaluated_strategies,
+            }
             return None
 
-        best_signal.reason = f"WEIGHTED CONSENSUS ({len(winning_sigs)} models) | " + best_signal.reason
-        return best_signal
+        # ─── Step 9: Full scorecard for transparency ─────────────────────
+        self._last_scorecard = {
+            "decision": action,
+            "consensus_confidence": round(consensus_signal.confidence, 4),
+            "buy_score": round(buy_score, 4),
+            "sell_score": round(sell_score, 4),
+            "agreement_ratio": round(agreement_ratio, 4),
+            "num_agreeing": num_agreeing,
+            "num_opposing": len(losing_sigs),
+            "total_active": len(active_signals),
+            "total_strategies": len(self.strategies),
+            "agreeing_strategies": strategy_names,
+            "opposing_strategies": [s.strategy_name for s in losing_sigs],
+            "aggregated_entry": round(agg_entry, 2),
+            "aggregated_sl": round(agg_sl, 2),
+            "aggregated_tp": round(agg_tp, 2),
+            "strategies": evaluated_strategies,
+        }
+
+        _log.info(
+            "CONSENSUS SCORECARD | %s | confidence=%.2f%% | agree=%d oppose=%d | "
+            "buy_score=%.4f sell_score=%.4f | agreement=%.0f%% | strategies=%s",
+            action.upper(),
+            consensus_signal.confidence * 100,
+            num_agreeing,
+            len(losing_sigs),
+            buy_score,
+            sell_score,
+            agreement_ratio * 100,
+            ", ".join(strategy_names),
+        )
+
+        consensus_signal.reason = (
+            f"CONSENSUS ({num_agreeing} agree, {len(losing_sigs)} oppose, "
+            f"{agreement_ratio:.0%} agreement) | {primary_reason}"
+        )
+        return consensus_signal

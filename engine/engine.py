@@ -186,14 +186,14 @@ class TradingEngine:
             "asset_correlation": self.cache.get("asset_correlation_market"),
         }
 
-        # 3. DYNAMIC STRATEGY SELECTION
-        # We scan all available strategies and pick the one with the highest confidence
+        # 3. DYNAMIC STRATEGY SELECTION — Multi-Strategy Consensus Engine
         best_signal = self.orchestrator.get_best_signal(df, indicators)
+        scorecard = self.orchestrator.last_scorecard or {}
         
         if best_signal:
             plan = {
                 "symbol": symbol,
-                "regime": {"name": "multi_strategy_scanning", "tradable": True},
+                "regime": {"name": "consensus_scoring", "tradable": True},
                 "selected": {
                     "strategy": best_signal.strategy_name,
                     "action": best_signal.action,
@@ -204,10 +204,12 @@ class TradingEngine:
                     "expected_r": (abs(best_signal.take_profit - best_signal.entry) / abs(best_signal.entry - best_signal.stop_loss)) if best_signal.stop_loss and abs(best_signal.entry - best_signal.stop_loss) > 0 else 2.0,
                     "reason": best_signal.reason
                 },
-                "bias": htf_bias
+                "bias": htf_bias,
+                "consensus": scorecard,
             }
         else:
-            plan = {"symbol": symbol, "regime": "Unknown", "selected": None, "reason": "No strategy found an edge"}
+            hold_reason = scorecard.get("reason", "No strategy found an edge")
+            plan = {"symbol": symbol, "regime": "Unknown", "selected": None, "reason": hold_reason, "consensus": scorecard}
 
         state.update({
             "df": df, "price": price, "balance": balance,

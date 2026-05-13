@@ -29,6 +29,7 @@ class BacktestEngine:
         self.starting_equity = 10_000.0
         self.maker_fee = 0.0002 # 0.02%
         self.taker_fee = 0.0005 # 0.05%
+        self.fee_rate = self.taker_fee  # Used by _open_or_close for entry fills (market orders)
         self.slippage_pct = 0.0003
         self.spread_pct = 0.0002
         self.market_depth_usdt = 100_000.0

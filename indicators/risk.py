@@ -145,15 +145,26 @@ def calculate_risk_parameters(
         
     final_risk_pct *= liquidity_penalty
 
-    if stop_loss_value and stop_loss_value != current_price:
-        risk_amount  = free_balance * final_risk_pct
-        sl_dist      = abs(current_price - stop_loss_value)
-        asset_amount = risk_amount / sl_dist if sl_dist > 0 else 0.0
-        notional     = asset_amount * current_price
-        max_notional  = free_balance * max_position_pct
-        if notional > max_notional:
-            asset_amount = max_notional / current_price
-            notional     = max_notional
+    if not stop_loss_value or stop_loss_value == current_price:
+        return {
+            "action": "lock",
+            "reason": "No valid stop loss provided for position sizing",
+            "recommended_amount": 0.0,
+            "risk_pct": 0.0,
+            "notional_value": 0.0,
+            "sl_distance_pct": 0,
+            "liquidity_penalty": liquidity_penalty < 1.0,
+        }
+
+    risk_amount  = free_balance * final_risk_pct
+    sl_dist      = abs(current_price - stop_loss_value)
+    asset_amount = risk_amount / sl_dist if sl_dist > 0 else 0.0
+    notional     = asset_amount * current_price
+    max_notional  = free_balance * max_position_pct
+    if notional > max_notional:
+        asset_amount = max_notional / current_price
+        notional     = max_notional
+
     if notional < min_order_quote:
         # If the account can afford the minimum, we bump it to the minimum 
         # instead of locking. This is crucial for small accounts ($20-$50).
@@ -167,7 +178,7 @@ def calculate_risk_parameters(
                 "recommended_amount": round(asset_amount, 6),
                 "risk_pct": round(final_risk_pct * 100, 2),
                 "notional_value": round(notional, 2),
-                "sl_distance_pct": round(abs(current_price - (stop_loss_value or 0)) / current_price * 100, 2) if stop_loss_value else 0,
+                "sl_distance_pct": round(sl_dist / current_price * 100, 2),
                 "liquidity_penalty": liquidity_penalty < 1.0,
             }
 
@@ -176,6 +187,6 @@ def calculate_risk_parameters(
         "recommended_amount": round(asset_amount, 6),
         "risk_pct":         round(final_risk_pct * 100, 2),
         "notional_value":   round(notional, 2),
-        "sl_distance_pct":  round(abs(current_price - (stop_loss_value or 0)) / current_price * 100, 2) if stop_loss_value else 0,
+        "sl_distance_pct":  round(sl_dist / current_price * 100, 2),
         "liquidity_penalty": liquidity_penalty < 1.0
     }

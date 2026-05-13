@@ -539,9 +539,25 @@ class TradeXProClone:
         reg.add_row("Trend", f"[{tc}]{regime.get('trend', 'N/A')}[/]"); reg.add_row("Volatility", regime.get("volatility", "N/A"))
         reg.add_row("Tradable", "[green]YES[/]" if regime.get("tradable") else "[red]NO[/]")
         reg.add_row("Structure", f"[bold yellow]{smc.get('structure', 'N/A')}[/]")
-        reg.add_row("Iceberg", f"[bold cyan]{of.get('iceberg', 'None')}[/]")
         reg.add_row("HTF Bias", f"[bold]{plan.get('bias', 'Neutral')}[/]")
-        layout["regime"].update(Panel(reg, title="[bold]Regime & OrderFlow[/]", border_style="magenta"))
+        
+        # Consensus Scoring Display
+        consensus = plan.get("consensus", {})
+        if consensus:
+            buy_sc = consensus.get("buy_score", 0.0)
+            sell_sc = consensus.get("sell_score", 0.0)
+            agree = consensus.get("num_agreeing", 0)
+            oppose = consensus.get("num_opposing", 0)
+            agreement = consensus.get("agreement_ratio", 0.0)
+            decision = consensus.get("decision", "hold")
+            dec_color = "green" if decision == "buy" else "red" if decision == "sell" else "dim"
+            reg.add_row("", "")
+            reg.add_row("Buy Score", f"[green]{buy_sc:.4f}[/]")
+            reg.add_row("Sell Score", f"[red]{sell_sc:.4f}[/]")
+            reg.add_row("Agreement", f"[bold cyan]{agreement:.0%}[/]" if agreement else "[dim]N/A[/]")
+            reg.add_row("Consensus", f"[{dec_color}]{agree} agree / {oppose} oppose[/]")
+        
+        layout["regime"].update(Panel(reg, title="[bold]Regime & Consensus[/]", border_style="magenta"))
 
         ind = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
         ind.add_row("ADX", f"{trend.get('adx', 0):.1f}"); ind.add_row("ATR %", f"{vol.get('atr_pct', 0):.2f}%")
