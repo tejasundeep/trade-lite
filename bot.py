@@ -707,7 +707,8 @@ class TradeXProClone:
             self.symbol_states[symbol] = res # Persist state (including HTF cache)
             
             dec = res.get("decision", {})
-            if dec.get("action") == "trade" and dec.get("confidence", 0) >= 0.75: return res
+            # MODIFIED: Lowered to 0.70 to match engine strategy gates
+            if dec.get("action") == "trade" and dec.get("confidence", 0) >= 0.70: return res
         except Exception as e: log.error(f"scan {symbol}: {e}")
         return None
 
@@ -985,18 +986,34 @@ class TradeXProClone:
                     self.symbol_states[s] = sym_state
                     
                     decision = sym_state.get("decision", {})
-                    if decision.get("action") in ["buy", "sell"]:
+                    # MODIFIED: Engine uses 'trade' action for execution signals
+                    if decision.get("action") in ["buy", "sell", "trade"]:
                         candidates.append(sym_state)
 
-                # 5. Execution
+                # 5. Execution (Multi-Entry Upgrade)
                 open_count = len(await asyncio.to_thread(self.tools.get_open_positions))
-                max_pos = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
-
+                max_pos = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
+                
                 if candidates and open_count < max_pos:
-                    best = max(candidates, key=lambda r: r["decision"].get("confidence", 0) * r["decision"].get("expected_r", 1))
-                    async with self._trade_lock:
-                        final_res = await self.engine.run(best, execute=True, streamer=self.streamer)
-                        self.symbol_states[best['symbol']] = final_res
+                    # Sort candidates by confidence
+                    candidates.sort(key=lambda r: r["decision"].get("confidence", 0), reverse=True)
+                    
+                    for candidate in candidates:
+                        if open_count >= max_pos: break
+                        
+                        symbol = candidate['symbol']
+                        log.info(f"Targeting {symbol} for entry (confidence: {candidate['decision'].get('confidence', 0):.2f})")
+                        
+                        async with self._trade_lock:
+                            final_res = await self.engine.run(candidate, execute=True, streamer=self.streamer)
+                            self.symbol_states[symbol] = final_res
+                            
+                            dec = final_res.get("decision", {})
+                            if dec.get("action") == "trade_executed":
+                                open_count += 1
+                                log.info(f"Successfully entered {symbol}. Open count: {open_count}")
+                            else:
+                                log.info(f"Entry result for {symbol}: {dec.get('action')} - {dec.get('reason', 'N/A')}")
 
                 await asyncio.sleep(3) # Elite cycle frequency
             except asyncio.CancelledError:

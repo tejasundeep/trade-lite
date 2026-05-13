@@ -97,8 +97,8 @@ def calculate_risk_parameters(
     if is_last_trade_loss:
         state["consecutive_losses"] += 1
         state["last_loss_time"]      = now
-        # Reduced from exponential (4^n hours) to a flat 1 hour for better activity
-        state["lock_until"] = now + 3600 
+        # DISABLED: Removed the 1-hour lock after loss to keep bot active as requested
+        state["lock_until"] = 0 
         _save_state(state)
     elif state["consecutive_losses"] > 0:
         state["consecutive_losses"] = 0

@@ -619,6 +619,79 @@ class ClimaxReversalStrategy(BaseStrategy):
                 )
         return None
 
+class PureMomentumStrategy(BaseStrategy):
+    def __init__(self):
+        super().__init__("Pure Momentum", weight=1.4)
+
+    def evaluate(self, df: pd.DataFrame, indicators: Dict) -> Optional[StrategySignal]:
+        price = float(df.iloc[-1]["close"])
+        ema_50 = df["EMA_50"].iloc[-1] if "EMA_50" in df.columns else None
+        trend = indicators.get("trend", {})
+        vol = indicators.get("vol", {})
+        atr = vol.get("atr", price * 0.01)
+        adx = trend.get("adx", 0)
+        
+        # Strong Momentum: ADX > 30 and price moving away from EMA
+        if adx > 30:
+            # Bullish Momentum
+            if price > ema_50 * 1.002 and df["close"].iloc[-1] > df["close"].iloc[-3]:
+                 return StrategySignal(
+                    strategy_name=self.name,
+                    action="buy",
+                    confidence=0.85,
+                    entry=price,
+                    stop_loss=price - atr * 2.5,
+                    take_profit=price + atr * 5.0,
+                    reason="Aggressive Momentum: Strong ADX + Price Expansion"
+                )
+            # Bearish Momentum (Dipping)
+            elif price < ema_50 * 0.998 and df["close"].iloc[-1] < df["close"].iloc[-3]:
+                 return StrategySignal(
+                    strategy_name=self.name,
+                    action="sell",
+                    confidence=0.85,
+                    entry=price,
+                    stop_loss=price + atr * 2.5,
+                    take_profit=price - atr * 5.0,
+                    reason="Aggressive Momentum: Strong ADX + Price Expansion (Shorting the Dip)"
+                )
+        return None
+
+class PanicScalperStrategy(BaseStrategy):
+    def __init__(self):
+        super().__init__("Panic Scalper", weight=1.8)
+
+    def evaluate(self, df: pd.DataFrame, indicators: Dict) -> Optional[StrategySignal]:
+        price = float(df.iloc[-1]["close"])
+        of = indicators.get("order_flow", {})
+        vol = indicators.get("vol", {})
+        atr = vol.get("atr", price * 0.01)
+        delta = of.get("delta", 0)
+        cvd = of.get("cvd", 0)
+        
+        # Panic: Extreme Delta + Price making new 5-period lows
+        if delta < -5.0 and price < df["low"].tail(5).min() * 1.001:
+            return StrategySignal(
+                strategy_name=self.name,
+                action="sell",
+                confidence=0.92,
+                entry=price,
+                stop_loss=price + atr * 1.5,
+                take_profit=price - atr * 4.0,
+                reason="Panic detected: Aggressive selling + Price breakdown"
+            )
+        elif delta > 5.0 and price > df["high"].tail(5).max() * 0.999:
+            return StrategySignal(
+                strategy_name=self.name,
+                action="buy",
+                confidence=0.92,
+                entry=price,
+                stop_loss=price - atr * 1.5,
+                take_profit=price + atr * 4.0,
+                reason="FOMO detected: Aggressive buying + Price breakout"
+            )
+        return None
+
 class StrategyOrchestrator:
     """
     Multi-Strategy Consensus Engine.
@@ -645,7 +718,9 @@ class StrategyOrchestrator:
             InstitutionalTrapStrategy(),
             CVDAbsorptionStrategy(),
             SilverBulletStrategy(),
-            EliteSMCStrategy()
+            EliteSMCStrategy(),
+            PureMomentumStrategy(),
+            PanicScalperStrategy()
         ]
         self._last_scorecard: Optional[Dict] = None
 
@@ -836,7 +911,9 @@ class StrategyOrchestrator:
         liquidity = indicators.get("liquidity", {})
 
         if (sentiment < 20 and action == "sell") or (sentiment > 80 and action == "buy"):
-            consensus_signal.confidence *= 0.85
+            # MODIFIED: Reduce penalty if it's a strong trend move
+            penalty = 0.95 if consensus_signal.confidence > 0.85 else 0.85
+            consensus_signal.confidence *= penalty
 
         # Dynamic Liquidity Targets
         if action == "buy":
@@ -852,11 +929,11 @@ class StrategyOrchestrator:
                 if valid_targets:
                     consensus_signal.take_profit = max(valid_targets)
 
-        # Final confidence gate
-        if consensus_signal.confidence < 0.75:
+        # Final confidence gate (MODIFIED: Lowered to 0.70 for better responsiveness)
+        if consensus_signal.confidence < 0.70:
             self._last_scorecard = {
                 "decision": "hold",
-                "reason": f"Consensus confidence {consensus_signal.confidence:.2%} below 75% gate",
+                "reason": f"Consensus confidence {consensus_signal.confidence:.2%} below 70% gate",
                 "buy_score": round(buy_score, 4), "sell_score": round(sell_score, 4),
                 "agreement": round(agreement_ratio, 4),
                 "strategies": evaluated_strategies,

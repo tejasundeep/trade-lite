@@ -250,8 +250,9 @@ class TradingEngine:
         if df is not None and not df.empty:
             avg_atr = df["high"].tail(20).max() - df["low"].tail(20).min()
             current_atr = vol_data.get("atr", 0)
-            if current_atr > avg_atr * 2.5:
-                 state["decision"] = {"action": "hold", "reason": "Circuit Breaker: Extreme Volatility detected (News Shock?)"}
+            # RELAXED: 5.0x instead of 2.5x to allow trading in high-momentum crashes
+            if current_atr > avg_atr * 5.0:
+                 state["decision"] = {"action": "hold", "reason": "Circuit Breaker: Unprecedented Volatility (5.0x normal range)"}
                  return state
 
         of_data  = indicators.get("order_flow", {})
@@ -273,8 +274,9 @@ class TradingEngine:
         # --- ELITE SAFEGUARD: Portfolio Correlation Guard ---
         try:
             all_positions = self.tools.adapter.get_positions()
-            if len(all_positions) >= 3 and not position:
-                state["decision"] = {"action": "hold", "reason": "Portfolio Guard: Max concurrent positions reached"}
+            max_pos = getattr(self.risk_manager.config, "max_concurrent_positions", 5)
+            if len(all_positions) >= max_pos and not position:
+                state["decision"] = {"action": "hold", "reason": f"Portfolio Guard: Max positions ({max_pos}) reached"}
                 return state
         except: pass
 

@@ -42,14 +42,39 @@ class TradingChatbot:
                     guard_status = "TRIPPED (Trading Halted)"
                     guard_reason = self.bot.guard.trip_reason
 
-            # 4. Active Analysis (SMC/FVG)
+            # 4. Active Analysis (All Strategies + Consensus)
             analysis_summary = ""
             if self.bot and hasattr(self.bot, "symbol_states"):
-                analysis_summary = "\nCURRENT MARKET ANALYSIS (SMC/Indicators):\n"
+                analysis_summary = "\nCURRENT MARKET ANALYSIS (Multi-Strategy Consensus):\n"
                 for s, state in self.bot.symbol_states.items():
                     inds = state.get("indicators", {})
                     smc = inds.get("smc", {})
-                    analysis_summary += f"- {s}: Price {state.get('price')}. Structure: {smc.get('structure', 'N/A')}. Zone: {smc.get('zone', 'N/A')}. RSI: {inds.get('rsi', 'N/A')}\n"
+                    of = inds.get("order_flow", {})
+                    vol = inds.get("vol", {})
+                    trend = inds.get("trend", {})
+                    vwap = inds.get("vwap", {})
+                    bb = inds.get("bollinger", {})
+                    plan = state.get("plan", {})
+                    decision = state.get("decision", {})
+                    consensus = plan.get("consensus", {})
+                    selected = plan.get("selected", {})
+                    
+                    analysis_summary += f"- {s}: Price {state.get('price')}.\n"
+                    analysis_summary += f"  Indicators: RSI={inds.get('rsi', 'N/A')}, ADX={trend.get('adx', 'N/A')}, ATR%={vol.get('atr_pct', 'N/A')}, VWAP Z={vwap.get('z_score', 'N/A')}\n"
+                    analysis_summary += f"  SMC: Structure={smc.get('structure', 'N/A')}, Zone={smc.get('zone', 'N/A')}\n"
+                    analysis_summary += f"  Order Flow: Delta={of.get('delta', 'N/A')}, CVD={of.get('cvd', 'N/A')}, Absorption={of.get('absorption', 'N/A')}\n"
+                    analysis_summary += f"  Bollinger: Upper={bb.get('upper', 'N/A')}, Lower={bb.get('lower', 'N/A')}\n"
+                    
+                    if consensus:
+                        analysis_summary += f"  CONSENSUS: Buy Score={consensus.get('buy_score', 0)}, Sell Score={consensus.get('sell_score', 0)}, Agreement={consensus.get('agreement_ratio', 0):.0%}\n"
+                        analysis_summary += f"  Agreeing: {consensus.get('agreeing_strategies', [])}\n"
+                        analysis_summary += f"  Opposing: {consensus.get('opposing_strategies', [])}\n"
+                    
+                    if selected:
+                        analysis_summary += f"  Selected Strategy: {selected.get('strategy', 'None')} (conf={selected.get('confidence', 0):.2%})\n"
+                    
+                    if decision:
+                        analysis_summary += f"  Decision: {decision.get('action', 'hold')} - {decision.get('reason', 'N/A')}\n"
 
             # 5. DB Positions & Trades
             log.debug("Fetching positions from DB...")
@@ -104,7 +129,7 @@ class TradingChatbot:
         if "resume" in q or "reset safety" in q or "start trading" in q:
             if self.bot and self.bot.guard:
                 self.bot.guard.reset()
-                return "✅ **TRADING RESUMED.** I have reset the circuit breakers. The autonomous engine is now re-scanning the markets for SMC setups. Let's get back to work."
+                return "✅ **TRADING RESUMED.** I have reset the circuit breakers. The autonomous engine is now re-scanning the markets using all strategies (consensus scoring). Let's get back to work."
 
         # 3. Manual Liquidation (Two-step verification)
         if "close all" in q and ("position" in q or "trade" in q):
@@ -122,17 +147,32 @@ class TradingChatbot:
         context = self.get_context()
         
         system_prompt = f"""
-        You are the 'Elite SMC Trading Bot' AI Assistant. 
-        Your mission is to be the 'Perfect Assistant' between the User and the Autonomous Engine.
+        You are the 'TradeX Pro' AI Trading Assistant.
+        Your mission is to be the 'Perfect Assistant' between the User and the Autonomous Multi-Strategy Consensus Engine.
         
         Current System Context:
         {context}
         
+        CRITICAL: This bot uses a MULTI-STRATEGY CONSENSUS ENGINE with 15 strategies.
+        Each strategy has a weight, and the bot trades based on the COMBINED weighted score of ALL strategies.
+        SMC is just ONE of 15 strategies. Others include: Momentum Breakout, VWAP Mean Reversion,
+        Range Mean Reversion (Bollinger/RSI), Trend Scalper (EMA), Tape Reading (Order Flow),
+        CVD Absorption, Liquidation Hunter, AMD (Power of Three), Coinbase Premium, Leader-Laggard,
+        Institutional Climax, Elite Structural Breakout, and Silver Bullet.
+        
+        When explaining trades or decisions:
+        - Reference the ACTUAL strategies that fired (shown in consensus data), not just SMC.
+        - Explain the consensus scoring: buy score vs sell score, agreement ratio, conflict penalties.
+        - If multiple strategies agree, highlight the CONFLUENCE.
+        - If the bot is holding, explain WHICH strategies disagreed or why consensus was weak.
+        - Reference actual indicator values (RSI, ADX, VWAP Z-score, Bollinger position, etc.)
+        
         AI MISSION:
-        1. Explain the SMC (Smart Money Concepts) logic behind current and past trades.
-        2. Handle user concerns about 'Why no trades?' by explaining volatility, spread, or trend bias.
+        1. Explain which strategies contributed to each trade decision and why.
+        2. Handle 'Why no trades?' by showing the consensus scorecard (weak agreement, conflicting strategies, etc.)
         3. Be the user's hands: If they want to stop, suggest the 'emergency stop' command.
-        4. Maintain a professional, 'Elite Hedge Fund' tone.
+        4. Maintain a professional, data-driven, analytical tone.
+        5. NEVER attribute all decisions to SMC alone. Always reference the full multi-strategy picture.
         """
         
         # Maintain history

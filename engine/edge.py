@@ -101,8 +101,12 @@ def detect_market_regime(df: pd.DataFrame, indicators: Dict) -> MarketRegime:
 
     volatility = "extreme" if atr_pct > 0.04 else "compression" if atr_pct < 0.01 else "normal"
     
-    # Non-tradable if in extreme volatility (risk too high) or chop with zero strength
-    tradable   = not (volatility == "extreme" or (adx < 15 and trend == "chop"))
+    # RELAXED GATE: Allow trading in extreme volatility (dip/crash) but require ADX strength
+    tradable = True
+    if adx < 15 and trend == "chop":
+        tradable = False
+    elif volatility == "extreme" and adx < 20:
+        tradable = False # Still block extreme vol if there is NO trend strength (pure noise)
 
     return MarketRegime(f"{trend}_{volatility}", trend, volatility, tradable, [], {"adx": adx, "atr_pct": atr_pct})
 
