@@ -348,6 +348,7 @@ class TradingEngine:
                 symbol=symbol, side=side, amount=amount,
                 price=price, stop_loss=stop_loss,
                 take_profit=take_profit, reason=decision.get("reason", "Edge"),
+                logic_snapshot=state.get("indicators")
             )
             state["execution_result"] = result
             if result.get("error"):

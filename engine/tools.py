@@ -391,116 +391,158 @@ class TradingTools:
         finally:
             session.close()
 
+    def get_open_positions(self) -> List[Dict]:
+        """Returns all currently open positions from the database."""
+        session = get_session()
+        try:
+            positions = session.query(Position).all()
+            return [{"symbol": pos.symbol, "avg_price": pos.avg_price,
+                     "amount": pos.amount, "side": pos.side,
+                     "stop_loss": pos.stop_loss, "take_profit": pos.take_profit,
+                     "tp1_hit": pos.tp1_hit, "trailing_stop": pos.trailing_stop_price} 
+                    for pos in positions]
+        finally:
+            session.close()
+
     def sync_positions_from_exchange(self, symbols: Optional[List[str]] = None):
         """
         Backward-compatible wrapper for the execution reconciler.
         """
         return self.reconcile_execution_state(symbols=symbols)
 
+    def close_all_positions(self, reason: str = "User manual close"):
+        """Emergency method to close all currently open positions."""
+        session = get_session()
+        try:
+            positions = session.query(Position).all()
+            if not positions:
+                return {"count": 0, "message": "No positions to close."}
+            
+            closed_count = 0
+            for pos in positions:
+                try:
+                    ticker = self.adapter.get_ticker(pos.symbol)
+                    price = float(ticker.get("price", 0.0))
+                    if price > 0:
+                        self._execute_full_close(session, pos, price, reason)
+                        closed_count += 1
+                except Exception as e:
+                    log.error(f"Failed to close {pos.symbol}: {e}")
+            
+            return {"count": closed_count, "message": f"Successfully closed {closed_count} positions."}
+        finally:
+            session.close()
+
     def manage_open_positions(self, prices: Dict[str, float], atr_map: Dict[str, float], smc_map: Dict[str, Dict] = None):
-        """Scale out at 1:1 R/R, move SL to breakeven+, and trail the remainder structurally."""
-        log.info("Starting manage_open_positions DB session...")
+        """Elite Active Management: Continuous structural re-evaluation and dynamic exits."""
+        log.info("Starting Elite Active Management cycle...")
         session = get_session()
         smc_map = smc_map or {}
         try:
-            log.info("Querying local positions...")
             positions = session.query(Position).all()
-            log.info(f"Processing {len(positions)} local positions...")
             for pos in positions:
                 price = prices.get(pos.symbol)
                 atr = atr_map.get(pos.symbol, price * 0.01) if price else 0
-                log.info(f"Checking {pos.symbol}: price={price} atr={atr}")
+                smc = smc_map.get(pos.symbol, {})
                 if not price or not atr: continue
                 
-                # 0. Local SL/TP Trigger Check (Safety Fallback)
+                # --- DYNAMIC EXIT LOGIC (THE 'PERSON-LIKE' BRAIN) ---
+                structure = smc.get("structure", "Neutral")
+                trend = smc.get("trend", "Neutral")
+                zone = smc.get("zone", "Neutral")
+                
+                exit_reason = None
+                
+                # 1. Structural Invalidation (Immediate Exit if trend flips)
+                if pos.side == "long" and structure == "Bearish":
+                    exit_reason = "Structural Break (Bearish Flip)"
+                elif pos.side == "short" and structure == "Bullish":
+                    exit_reason = "Structural Break (Bullish Flip)"
+                
+                # 2. Overextended Reversal (Profit Guard)
+                pnl_pct = (price - pos.avg_price) / pos.avg_price if pos.side == "long" else (pos.avg_price - price) / pos.avg_price
+                if pnl_pct > 0.005: # If in >0.5% profit
+                    if pos.side == "long" and zone == "Premium":
+                        exit_reason = "Momentum Exhaustion (Premium Zone)"
+                    elif pos.side == "short" and zone == "Discount":
+                        exit_reason = "Momentum Exhaustion (Discount Zone)"
+
+                # 3. Trailing Stop Activation (Dynamic Tightening)
+                if pnl_pct > 0.01: # In >1% profit
+                     new_sl = price - (atr * 1.0) if pos.side == "long" else price + (atr * 1.0)
+                     if (pos.side == "long" and new_sl > pos.stop_loss) or (pos.side == "short" and new_sl < pos.stop_loss):
+                         log.info(f"Dynamic SL tightening for {pos.symbol} to {new_sl}")
+                         pos.stop_loss = new_sl
+
+                if exit_reason:
+                    log.warning(f"Elite Exit triggered for {pos.symbol}: {exit_reason} at {price}")
+                    self._execute_full_close(session, pos, price, exit_reason, logic_snapshot=smc)
+                    continue
+
+                # --- LEGACY SAFETY FALLBACKS ---
                 is_sl_hit = (pos.side == "long" and price <= pos.stop_loss) or (pos.side == "short" and price >= pos.stop_loss)
                 is_tp_hit = (pos.side == "long" and price >= pos.take_profit and pos.take_profit > 0) or (pos.side == "short" and price <= pos.take_profit and pos.take_profit > 0)
                 
                 if is_sl_hit or is_tp_hit:
-                    reason = "Local Stop Loss Hit" if is_sl_hit else "Local Take Profit Hit"
-                    log.warning(f"{reason} for {pos.symbol} at {price}. Executing market close.")
-                    m_symbol = self.adapter.get_market_symbol(pos.symbol)
-                    side = "sell" if pos.side == "long" else "buy"
-                    res = self.adapter.place_market_order(m_symbol, side, pos.amount, reduce_only=True, position_side=pos.side.upper())
-                    if not res.get("error"):
-                        session.delete(pos)
-                        session.commit()
-                        self._cancel_exchange_orders(pos.symbol)
-                        log.info(f"Successfully closed {pos.symbol} via {reason}")
-                        continue
-                    else:
-                        log.error(f"Failed to execute local exit for {pos.symbol}: {res.get('error')}")
+                    reason = "Hard SL Hit" if is_sl_hit else "Hard TP Hit"
+                    self._execute_full_close(session, pos, price, reason, logic_snapshot=smc)
+                    continue
 
                 risk = abs(pos.avg_price - pos.stop_loss)
                 if risk < (pos.avg_price * 0.0001): continue
                 
-                # 1. Target 1 (1:1 R/R) -> Breakeven+
+                # 0.5. Breakeven at 0.5R (Safety)
                 if not pos.tp1_hit:
+                    be_threshold_px = pos.avg_price + (risk * 0.5) if pos.side == "long" else pos.avg_price - (risk * 0.5)
+                    is_at_05r = (pos.side == "long" and price >= be_threshold_px) or (pos.side == "short" and price <= be_threshold_px)
+                    be_px = pos.avg_price * 1.0015 if pos.side == "long" else pos.avg_price * 0.9985
+                    if is_at_05r:
+                        if (pos.side == "long" and be_px > pos.stop_loss) or (pos.side == "short" and be_px < pos.stop_loss):
+                            log.info(f"0.5R reached for {pos.symbol}. Moving SL to Breakeven+ at {be_px}")
+                            pos.stop_loss = be_px
+                            session.commit()
+                            self._refresh_exchange_exits(pos)
                     tp1_px = pos.avg_price + risk if pos.side == "long" else pos.avg_price - risk
                     is_tp1 = (pos.side == "long" and price >= tp1_px) or (pos.side == "short" and price <= tp1_px)
                     
                     if is_tp1:
-                        log.info(f"TP1 for {pos.symbol}. Move to BE+ (fees coverage).")
+                        log.info(f"TP1 for {pos.symbol}. Move to BE+ and scale out 50%.")
                         m_symbol = self.adapter.get_market_symbol(pos.symbol)
                         close_amt = pos.amount * 0.5
                         side = "sell" if pos.side == "long" else "buy"
-                        result = self.adapter.place_market_order(
-                            m_symbol,
-                            side,
-                            close_amt,
-                            reduce_only=True,
-                            position_side=pos.side.upper(),
-                        )
-                        if result.get("error"):
-                            log.warning("TP1 partial close failed for %s: %s", pos.symbol, result.get("error"))
+                        result = self.adapter.place_market_order(m_symbol, side, close_amt, reduce_only=True, position_side=pos.side.upper())
+                        if not result.get("error"):
+                            closed_qty = float(result.get("executedQty", close_amt) or close_amt)
+                            pos.amount = max(pos.amount - closed_qty, 0.0)
+                            pos.stop_loss = be_px
+                            pos.tp1_hit = True
+                            pos.trailing_stop_price = be_px
+                            session.commit()
+                            self._refresh_exchange_exits(pos)
                             continue
-                        closed_qty = float(result.get("executedQty", close_amt) or close_amt)
-                        if closed_qty <= 0:
-                            log.warning("TP1 partial close returned zero fill for %s", pos.symbol)
-                            continue
-                        
-                        # BE+ (entry + 15bps to cover slippage/fees)
-                        be_plus = pos.avg_price * 1.0015 if pos.side == "long" else pos.avg_price * 0.9985
-                        pos.amount = max(pos.amount - closed_qty, 0.0)
-                        pos.stop_loss = be_plus
-                        pos.tp1_hit = True
-                        pos.trailing_stop_price = be_plus
-                        session.commit()
-                        self._refresh_exchange_exits(pos)
-                        continue
 
                 # 2. Structural Trailing Stop
                 if pos.tp1_hit:
-                    # Combined trail: Max(Structural Pivot, ATR Trail)
                     smc = smc_map.get(pos.symbol, {})
                     pd_arr = smc.get("pd_array", {})
-                    
                     if pos.side == "long":
-                        atr_trail = price - atr * 2.0
-                        struct_trail = pd_arr.get("low", 0) # Support pivot
+                        atr_trail = price - atr * 1.5
+                        struct_trail = pd_arr.get("low", 0)
                         current_trail = pos.trailing_stop_price or 0
                         potential_trail = max(atr_trail, struct_trail, current_trail)
-                        trail_changed = potential_trail > current_trail
-                        if trail_changed:
+                        if potential_trail > current_trail:
                             pos.trailing_stop_price = potential_trail
                         if pos.trailing_stop_price and price < pos.trailing_stop_price:
                             self._execute_full_close(session, pos, price, "Structural Trail Exit")
-                        elif trail_changed:
-                            session.commit()
-                            self._refresh_exchange_exits(pos)
                     else:
-                        atr_trail = price + atr * 2.0
-                        struct_trail = pd_arr.get("high", 999999999) # Resistance pivot
+                        atr_trail = price + atr * 1.5
+                        struct_trail = pd_arr.get("high", 999999999)
                         current_trail = pos.trailing_stop_price or 999999999
                         potential_trail = min(atr_trail, struct_trail, current_trail)
-                        trail_changed = potential_trail < current_trail
-                        if trail_changed:
+                        if potential_trail < current_trail:
                             pos.trailing_stop_price = potential_trail
                         if pos.trailing_stop_price and price > pos.trailing_stop_price:
                             self._execute_full_close(session, pos, price, "Structural Trail Exit")
-                        elif trail_changed:
-                            session.commit()
-                            self._refresh_exchange_exits(pos)
                     session.commit()
 
         except Exception as e:
@@ -508,38 +550,40 @@ class TradingTools:
         finally:
             session.close()
 
-    def _execute_full_close(self, session, pos, price, reason):
+    def _execute_full_close(self, session, pos, price, reason, logic_snapshot=None):
         log.info(f"Exiting full position {pos.symbol} via {reason}")
         m_symbol = self.adapter.get_market_symbol(pos.symbol)
         side = "sell" if pos.side == "long" else "buy"
         original_amount = pos.amount
+        
         result = self.adapter.place_market_order(
             m_symbol,
             side,
-            pos.amount,
+            original_amount,
             reduce_only=True,
             position_side=pos.side.upper(),
         )
+        
         if result.get("error"):
-            log.warning("Full close failed for %s: %s", pos.symbol, result.get("error"))
+            log.error(f"Full close failed for {pos.symbol}: {result.get('error')}")
             return False
+            
         closed_qty = float(result.get("executedQty", original_amount) or original_amount)
-        if closed_qty <= 0:
-            log.warning("Full close returned zero fill for %s", pos.symbol)
-            return False
+        # Record trade
         fill_px = price * (1 - (_SLIP_BPS + _FEE_BPS)) if side == "sell" else price * (1 + (_SLIP_BPS + _FEE_BPS))
         pnl = (fill_px - pos.avg_price) * closed_qty * (1 if pos.side == "long" else -1)
         session.add(Trade(symbol=pos.symbol, side=side, price=fill_px, amount=closed_qty,
-                         pnl=pnl, status="closed", reason=reason))
-        if closed_qty >= original_amount * 0.999:
+                         pnl=pnl, status="closed", reason=reason, logic_snapshot=json.dumps(logic_snapshot or {})))
+        
+        if closed_qty >= original_amount * 0.99:
             session.delete(pos)
-        else:
-            pos.amount = max(pos.amount - closed_qty, 0.0)
-        session.commit()
-        if closed_qty >= original_amount * 0.999:
             self._cancel_exchange_orders(pos.symbol)
         else:
+            pos.amount = max(pos.amount - closed_qty, 0.0)
             self._refresh_exchange_exits(pos)
+            
+        session.commit()
+        log.info(f"Successfully closed {pos.symbol} via {reason}. PnL: {pnl:.4f} USDT")
         return True
 
     def get_unrealized_pnl(self, symbol: str, current_price: float) -> float:
@@ -583,7 +627,8 @@ class TradingTools:
         finally: session.close()
 
     def execute_trade(self, symbol: str, side: str, amount: float, price: float,
-                      stop_loss: float, take_profit: float, reason: str = "Edge Signal") -> Dict:
+                      stop_loss: float, take_profit: float, reason: str = "Edge Signal",
+                      logic_snapshot: dict = None) -> Dict:
         session = get_session()
         try:
             today_pnl = self.get_todays_realized_pnl()
@@ -647,7 +692,8 @@ class TradingTools:
                 realized_pnl = (fill_price - pos.avg_price) * min(executed_qty, pos.amount) * factor
 
             session.add(Trade(symbol=symbol, side=side, price=fill_price, amount=executed_qty,
-                             pnl=realized_pnl, status="closed" if is_closing else "open", reason=reason))
+                             pnl=realized_pnl, status="closed" if is_closing else "open", 
+                             reason=reason, logic_snapshot=json.dumps(logic_snapshot or {})))
 
             if is_closing and pos:
                 if executed_qty >= pos.amount:

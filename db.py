@@ -19,6 +19,7 @@ class Trade(Base):
     pnl       = Column(Float)
     status    = Column(String)
     reason    = Column(String)
+    logic_snapshot = Column(String) # JSON field for AI context
     timestamp = Column(DateTime(timezone=True), default=utcnow, index=True)
 
 class Position(Base):
@@ -73,6 +74,15 @@ def init_db():
             session.execute(text("ALTER TABLE positions ADD COLUMN trailing_stop_price FLOAT"))
             session.commit()
             print("Migration: Added trailing_stop_price to positions")
+
+        # Check and add logic_snapshot to trades
+        try:
+            session.execute(text("SELECT logic_snapshot FROM trades LIMIT 1"))
+        except Exception:
+            session.rollback()
+            session.execute(text("ALTER TABLE trades ADD COLUMN logic_snapshot TEXT"))
+            session.commit()
+            print("Migration: Added logic_snapshot to trades")
             
     except Exception as e:
         print(f"Migration warning: {e}")

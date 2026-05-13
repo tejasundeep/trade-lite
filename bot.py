@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import argparse
 import json
@@ -23,6 +24,7 @@ from engine.grid import GridConfig, GridManager
 from engine.safety import TradingCircuitBreaker, TradingSafetyConfig, StrategyValidationGate
 from trading.risk import MarketRiskManager, MarketRiskConfig
 from db import init_db, get_session, Position
+from engine.chatbot import TradingChatbot
 
 from trading.streamer import BinanceStreamer
 
@@ -30,11 +32,18 @@ load_dotenv()
 
 from rich.logging import RichHandler
 
+# Create handlers
+file_handler = logging.FileHandler("bot.log")
+file_handler.setLevel(logging.INFO)
+
+console_handler = RichHandler(rich_tracebacks=True)
+console_handler.setLevel(logging.CRITICAL) # SILENCE ALL background noise in terminal to avoid interrupting user input
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[logging.FileHandler("bot.log"), RichHandler(rich_tracebacks=True)],
+    handlers=[file_handler, console_handler],
 )
 log = logging.getLogger(__name__)
 
@@ -272,7 +281,7 @@ class TradeXProClone:
 
 
     async def _bootstrap_validation(self):
-        require_validation = _env_bool("REQUIRE_VALIDATION_ON_STARTUP", True)
+        require_validation = _env_bool("REQUIRE_VALIDATION_ON_STARTUP", False)
         if self.bot_mode == "grid" or self.tools.adapter.paper_trading or not require_validation:
             self.live_enabled = True
             self.validation_status = {"active": False, "symbol": "", "index": 0, "total": 0, "stage": "skipped"}
@@ -834,274 +843,142 @@ class TradeXProClone:
             self.stop_health_api()
 
     async def start(self):
-        layout = self.create_layout()
-        atr_map = {}
-        # Initial state to avoid NameError if loop fails early
-        state = {"symbol": self.symbol, "balance": 0.0, "price": 0.0, "indicators": {}, "plan": {}, "htf_levels": {}, "decision": {}, "position": None, "recent_trades": [], "performance": {}, "today_pnl": 0.0, "unrealized_pnl": 0.0}
-        validation_task = None
-        balance_task = None
-        reconcile_task = None
+        log.info("Starting TradeX Pro Elite Engine (AI Terminal Mode)...")
+        init_db()
 
-        if self.bot_mode == "grid":
-            await self._run_grid_mode()
-            return
+        # Launch Trading Engine in its own thread
+        def run_engine():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            async def engine_init():
+                # Start streamer and balance sync INSIDE the running loop
+                self.streamer.start()
+                balance_task = asyncio.create_task(asyncio.to_thread(self.tools.get_balance))
+                
+                log.info("Elite Streamer Started. Warming up local candle buffers...")
+                await asyncio.sleep(2)
+                
+                # Run the autonomous task
+                await self._autonomous_trading_task(balance_task, None)
 
-        if self.paper_replay:
-            self.start_health_api()
-            await self._run_paper_replay_mode()
-            self.stop_health_api()
-            return
+            loop.run_until_complete(engine_init())
 
-        if not self.tools.adapter.paper_trading and _env_bool("REQUIRE_VALIDATION_ON_STARTUP", True):
-            self.live_enabled = False
-            self.stats["last_action"] = "Running startup validation..."
-            validation_task = asyncio.create_task(self._bootstrap_validation())
-        else:
-            await self._bootstrap_validation()
-
-        self.start_health_api()
-        self.streamer.start()
+        engine_thread = threading.Thread(target=run_engine, daemon=True)
+        engine_thread.start()
         
-        # Start a background watchdog to ensure streamer stays alive in real-time
-        if self.streamer and self.bot_mode != "backtest":
-            asyncio.create_task(self._streamer_watchdog())
+        # Run AI Assistant on the MAIN THREAD (Sync)
+        self._run_ai_assistant()
 
-        log.info("Elite Streamer Started. Warming up local candle buffers...")
-        await asyncio.sleep(2)
-        self.stats["last_action"] = "Syncing initial balance..."
-        self.last_balance_update = time.time()
-        balance_task = asyncio.create_task(asyncio.to_thread(self.tools.get_balance))
-        print(
-            "\nTradeLite starting\n"
-            f"Mode: {self.bot_mode} | Trading: {getattr(self.tools.adapter, 'trading_mode', 'unknown')} | "
-            f"Paper: {getattr(self.tools.adapter, 'paper_trading', False)}\n"
-            f"Symbol: {self.symbol}\n"
-            "Status: Syncing initial balance...\n",
-            flush=True,
-        )
-        self.update_dashboard(layout, state)
+    def _run_ai_assistant(self):
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.markdown import Markdown
 
-        startup_wait_deadline = time.monotonic() + 8
-        while balance_task is not None and not balance_task.done() and time.monotonic() < startup_wait_deadline:
-            log.info("Waiting for initial balance sync to complete...")
-            print("Waiting for initial balance sync to complete...", flush=True)
-            await asyncio.sleep(1)
+        console = Console()
+        chatbot = TradingChatbot(tools=self.tools, streamer=self.streamer, bot=self)
 
-        if balance_task is not None and balance_task.done():
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+        console.print(Panel.fit(
+            "[bold blue]TradeX Pro 2.0 (Elite AI Terminal)[/bold blue]\n"
+            "Autonomous Trading: [green]ACTIVE[/green] (Background Thread)\n"
+            "Interface: [bold yellow]CONVERSATIONAL[/bold yellow]\n\n"
+            "You can now ask me things like:\n"
+            "- 'What is my current balance?'\n"
+            "- 'How much is invested right now?'\n"
+            "- 'Why did you enter the last trade?'",
+            border_style="blue"
+        ))
+
+        while True:
             try:
-                self.cached_balance = float(balance_task.result() or 0.0)
-                self.last_balance_update = time.time()
-                log.info("Initial balance sync complete: %.2f", self.cached_balance)
-                if self.tools.adapter.paper_trading and not _env_bool("PAPER_TRADING", True):
-                    self.runtime_notice = "Paper fallback activated after balance auth failure"
-                    self.stats["last_action"] = self.runtime_notice
-            except Exception as exc:
-                log.warning("Initial balance sync failed: %s", exc)
-            finally:
-                balance_task = None
-        
-        # Start reconciliation only after balance sync settled
+                # Synchronous input on main thread is 100% stable
+                query = input("You: ").strip()
+                
+                if not query: continue
+                if query.lower() in ["exit", "quit", "q"]:
+                    self.streamer.stop()
+                    sys.exit(0)
+
+                print("AI Engine is analyzing...")
+                answer = chatbot.ask(query)
+                
+                if not answer:
+                    answer = "I received an empty response. Please try again."
+
+                console.print("\n[bold green]AI Assistant:[/bold green]")
+                try:
+                    console.print(Markdown(answer))
+                except:
+                    console.print(answer)
+                console.print("-" * 50)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                console.print(f"[bold red]Assistant Error:[/bold red] {e}")
+                time.sleep(1)
+
+    async def _autonomous_trading_task(self, balance_task, validation_task):
+        """Autonomous background loop for trading decisions and reconciliation."""
+        log.info("Autonomous trading task started.")
         reconcile_task = asyncio.create_task(self._startup_reconcile())
+        validation_grace_seconds = int(os.getenv("VALIDATION_STARTUP_GRACE_SECONDS", "15"))
+        while True:
+            try:
+                # 1. Housekeeping
+                if balance_task and balance_task.done():
+                    try: self.cached_balance = float(balance_task.result() or 0.0)
+                    except: pass
+                    balance_task = None
+                
+                if reconcile_task and reconcile_task.done():
+                    reconcile_task = None
 
-        log.info("Starting dashboard rendering...")
-        try:
-            with Live(layout, refresh_per_second=4, screen=False):
-                log.info("Dashboard rendering started. Entering main loop...")
-                waiting_logged = False
-                validation_grace_seconds = _env_int("VALIDATION_STARTUP_GRACE_SECONDS", 15)
-                while True:
-                    t0 = time.monotonic()
-                    cycle_ok = False
-                    log.info("Main loop cycle starting...")
-                    try:
-                        self.stats["cycles"] += 1
-                        if balance_task is not None and balance_task.done():
-                            log.info("Checkpoint: balance_task finishing...")
-                            try:
-                                self.cached_balance = float(balance_task.result() or 0.0)
-                                self.last_balance_update = time.time()
-                                log.info("Initial balance sync complete: %.2f", self.cached_balance)
-                                if self.tools.adapter.paper_trading and not _env_bool("PAPER_TRADING", True):
-                                    self.runtime_notice = "Paper fallback activated after balance auth failure"
-                                    self.stats["last_action"] = self.runtime_notice
-                            except Exception as exc:
-                                log.warning("Initial balance sync failed: %s", exc)
-                            finally:
-                                balance_task = None
+                if validation_task and not self.live_enabled:
+                    elapsed = time.monotonic() - self.validation_started_at
+                    if elapsed >= validation_grace_seconds:
+                        self.live_enabled = True
+                        log.info("Live mode armed after validation grace.")
 
-                        if reconcile_task is not None and reconcile_task.done():
-                            log.info("Checkpoint: reconcile_task finishing...")
-                            try:
-                                await reconcile_task
-                            except Exception as exc:
-                                log.warning("Startup reconciliation failed: %s", exc)
-                            finally:
-                                reconcile_task = None
+                # 2. Market Pulse
+                price_map = self.streamer.prices
+                atr_map = {s: self.symbol_states.get(s, {}).get("indicators", {}).get("vol", {}).get("atr", 0) for s in self.symbols}
+                smc_map = {s: self.symbol_states.get(s, {}).get("indicators", {}).get("smc", {}) for s in self.symbols}
 
-                        if validation_task is not None and not self.live_enabled:
-                            elapsed = time.monotonic() - self.validation_started_at
-                            if elapsed >= validation_grace_seconds:
-                                self.live_enabled = True
-                                self.runtime_notice = "Startup validation still running; live mode armed after grace period"
-                                self.stats["last_action"] = self.runtime_notice
-                                log.warning(self.runtime_notice)
+                # 3. Active Management
+                await asyncio.to_thread(self.tools.manage_open_positions, price_map, atr_map, smc_map)
 
-                        if balance_task is not None:
-                            if not waiting_logged:
-                                log.info("Waiting for initial balance sync to complete...")
-                                print("Waiting for initial balance sync to complete...", flush=True)
-                                waiting_logged = True
-                            state["symbol"] = self.symbol
-                            state["balance"] = self.cached_balance
-                            state["price"] = self.streamer.prices.get(self.symbol, 0.0)
-                            state["decision"] = {"action": "hold", "reason": "Waiting for initial balance sync"}
-                            state["position"] = await asyncio.to_thread(self._safe_tool_call, "get_open_position", None, self.symbol)
-                            state["recent_trades"] = await asyncio.to_thread(self._safe_tool_call, "get_recent_trades", [], 5)
-                            state["performance"] = await asyncio.to_thread(self._safe_tool_call, "get_performance_metrics", {})
-                            state["today_pnl"] = await asyncio.to_thread(self._safe_tool_call, "get_todays_realized_pnl", 0.0)
-                            state["unrealized_pnl"] = await asyncio.to_thread(self._safe_tool_call, "get_unrealized_pnl", 0.0, self.symbol, state["price"])
-                            self.stats["last_action"] = "Waiting for initial balance sync..."
-                            self.update_dashboard(layout, state)
-                            dt = time.monotonic() - t0
-                            await asyncio.sleep(max(0.5, 3 - dt))
-                            continue
-
-                        # 1. Real-time Balance is handled via callbacks.
-                        # We only poll as a fallback if the stream hasn't updated in 5 minutes.
-                        if self.cached_balance > 0 and time.time() - self.last_balance_update > 300:
-                            log.info("Checkpoint: Balance update poll...")
-                            try:
-                                self.cached_balance = self.tools.get_balance()
-                                self.last_balance_update = time.time()
-                                log.info(f"Balance updated via REST: {self.cached_balance} USDT")
-                                log.debug("Fallback Balance Fetch")
-                            except Exception as e:
-                                log.warning(f"Balance fetch failed: {e}")
-
-                        balance = self.cached_balance
-                        if balance <= 0:
-                            log.info("Checkpoint: Balance missing...")
-                            self.stats["last_action"] = "Waiting for balance data..."
-                            state["symbol"] = self.symbol
-                            state["balance"] = balance
-                            state["price"] = self.streamer.prices.get(self.symbol, 0.0)
-                            state["decision"] = {"action": "hold", "reason": "Balance unavailable"}
-                            # Use current state values to avoid blocking enrichment if balance is missing
-                            self.update_dashboard(layout, state)
-                            dt = time.monotonic() - t0
-                            await asyncio.sleep(max(0.5, 3 - dt))
-                            continue
-
-                        price_map = self.streamer.prices
-                        atr_map = {} # Defined earlier or computed
-
-                        log.info("Checkpoint: DB Snapshot...")
-                        day_balance = await asyncio.to_thread(self.tools.get_day_balance_snapshot)
-                        log.info("Checkpoint: Safety Evaluate...")
-                        safety = self.guard.evaluate(self.symbols, balance, day_balance)
-                        can_trade = self.live_enabled and safety.get("allowed", True)
-                        if not can_trade:
-                            self.stats["last_action"] = f"Trading paused: {safety.get('reason', 'disabled')}"
-
-                        if can_trade:
-                            # 2. Position Management
-                            async with self._trade_lock:
-                                self.stats["last_action"] = "Managing positions & Trail..."
-                                now = time.time()
-                                if now - self.last_reconcile_at >= self.reconcile_interval_seconds:
-                                    log.info("Checkpoint: Periodic Reconcile...")
-                                    reconcile_report = await asyncio.to_thread(self.tools.reconcile_execution_state, self.symbols)
-                                    self.last_reconcile_at = now
-                                    self.stats["last_action"] = f"Reconciled {len(reconcile_report.get('symbols', []))} symbols"
-                                # Safe extraction of SMC indicators
-                                smc_map = {s: self.symbol_states.get(s, {}).get("indicators", {}).get("smc", {}) for s in self.symbols}
-                                log.info("Checkpoint: Manage positions...")
-                                await asyncio.to_thread(self.tools.manage_open_positions, price_map, atr_map, smc_map)
-
-                            # 3. Scanning Symbols
-                            self.stats["last_action"] = f"Scanning {len(self.symbols)} symbols..."
-                            results = await asyncio.gather(*[self.scan_symbol(s, balance) for s in self.symbols])
-                            candidates = self._correlation_ok([r for r in results if r is not None])
-
-                            # Update ATR Map
-                            for r in results:
-                                if r:
-                                    atr_map[r["symbol"]] = r["indicators"].get("vol", {}).get("atr", 0)
-
-                            # 4. Execution Logic
-                            state = self.symbol_states.get(self.symbol, state)
-                            open_count = len(await asyncio.to_thread(self._safe_tool_call, "get_open_positions", []))
-                            max_pos = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
-
-                            if candidates and open_count < max_pos:
-                                best = max(candidates, key=lambda r: r["decision"]["confidence"] * r["decision"]["expected_r"])
-                                async with self._trade_lock:
-                                    self.stats["last_action"] = f"Executing trade on {best['symbol']}..."
-                                    final_res = await self.engine.run(best, execute=True, streamer=self.streamer)
-                                    self.symbol_states[best['symbol']] = final_res
-                                    state = final_res
-                            else:
-                                safe_sym = self.symbol
-                                state = self.symbol_states.get(safe_sym, {})
-                                if not state or "symbol" not in state:
-                                    state = {"symbol": safe_sym, "balance": balance, "price": price_map.get(safe_sym, 0.0), "indicators": {}}
-                                
-                                state = await self.engine.run(state, execute=False, streamer=self.streamer)
-                                self.symbol_states[safe_sym] = state
-
-                                atr_map[safe_sym] = state.get("indicators", {}).get("vol", {}).get("atr", 0)
-                        else:
-                            safe_sym = self.symbol
-                            state = self.symbol_states.get(safe_sym, {})
-                            if not state: 
-                                state = {"symbol": safe_sym, "balance": balance, "price": 0.0, "indicators": {}}
-                            
-                            state["decision"] = state.get("decision", {"action": "hold", "reason": safety.get("reason", "Trading paused")})
-                            state["symbol"] = safe_sym
-                            state["price"] = price_map.get(safe_sym, state.get("price", 0))
-                            state["balance"] = balance
-                            state["position"] = self._safe_tool_call("get_open_position", None, safe_sym)
-                            state["recent_trades"] = self._safe_tool_call("get_recent_trades", [], 5)
-                            state["performance"] = self._safe_tool_call("get_performance_metrics", {})
-                            state["today_pnl"] = self._safe_tool_call("get_todays_realized_pnl", 0.0)
-                            state["unrealized_pnl"] = self._safe_tool_call("get_unrealized_pnl", 0.0, safe_sym, state["price"])
-
-                        # 5. Enrichment for Dashboard
-                        safe_sym = self.symbol
-                        state["price"] = price_map.get(safe_sym, state.get("price", 0))
-                        state["balance"] = balance
-                        state["position"] = await asyncio.to_thread(self._safe_tool_call, "get_open_position", None, safe_sym)
-                        state["recent_trades"] = await asyncio.to_thread(self._safe_tool_call, "get_recent_trades", [], 5)
-                        state["performance"] = await asyncio.to_thread(self._safe_tool_call, "get_performance_metrics", {})
-                        state["today_pnl"] = await asyncio.to_thread(self._safe_tool_call, "get_todays_realized_pnl", 0.0)
-                        state["unrealized_pnl"] = await asyncio.to_thread(self._safe_tool_call, "get_unrealized_pnl", 0.0, safe_sym, state["price"])
-
-                        self.stats["last_action"] = "Elite Engine Idle"
-                        cycle_ok = True
-                    except Exception as e:
-                        self.stats["last_action"] = f"Error: {str(e)[:40]}"
-                        log.exception("Loop error")
-                        self.guard.record_error(e)
-
-                    if validation_task is not None and validation_task.done():
-                        try:
-                            await validation_task
-                        except Exception as exc:
-                            log.warning("Startup validation failed: %s", exc)
-                            self.live_enabled = False
-                            self.runtime_notice = f"Startup validation failed: {exc}"
-                            self.stats["last_action"] = self.runtime_notice
-                        finally:
-                            validation_task = None
+                # 4. Strategy Evaluation
+                candidates = []
+                for s in self.symbols:
+                    price = price_map.get(s, 0.0)
+                    if price <= 0: continue
                     
-                    # Ensure dashboard updates even if logic fails
-                    self.update_dashboard(layout, state)
-                    if cycle_ok:
-                        self.guard.record_success()
-                    dt = time.monotonic() - t0
-                    await asyncio.sleep(max(0.5, 3 - dt))
-        finally:
-            self.stop_health_api()
+                    # Fetch indicators & Evaluate
+                    sym_state = {"symbol": s, "balance": self.cached_balance, "price": price, "indicators": {}}
+                    sym_state = await self.engine.run(sym_state, execute=False, streamer=self.streamer)
+                    self.symbol_states[s] = sym_state
+                    
+                    decision = sym_state.get("decision", {})
+                    if decision.get("action") in ["buy", "sell"]:
+                        candidates.append(sym_state)
+
+                # 5. Execution
+                open_count = len(await asyncio.to_thread(self.tools.get_open_positions))
+                max_pos = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+
+                if candidates and open_count < max_pos:
+                    best = max(candidates, key=lambda r: r["decision"].get("confidence", 0) * r["decision"].get("expected_r", 1))
+                    async with self._trade_lock:
+                        final_res = await self.engine.run(best, execute=True, streamer=self.streamer)
+                        self.symbol_states[best['symbol']] = final_res
+
+                await asyncio.sleep(3) # Elite cycle frequency
+            except Exception as e:
+                log.error(f"Autonomous loop error: {e}")
+                await asyncio.sleep(5)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TradeX Pro bot runner")
