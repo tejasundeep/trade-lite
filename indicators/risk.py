@@ -97,7 +97,8 @@ def calculate_risk_parameters(
     if is_last_trade_loss:
         state["consecutive_losses"] += 1
         state["last_loss_time"]      = now
-        state["lock_until"] = now + (4 ** state["consecutive_losses"]) * 3600
+        # Reduced from exponential (4^n hours) to a flat 1 hour for better activity
+        state["lock_until"] = now + 3600 
         _save_state(state)
     elif state["consecutive_losses"] > 0:
         state["consecutive_losses"] = 0
@@ -138,20 +139,22 @@ def calculate_risk_parameters(
         if notional > max_notional:
             asset_amount = max_notional / current_price
             notional     = max_notional
-    else:
-        asset_amount = (free_balance * final_risk_pct) / current_price
-        notional     = asset_amount * current_price
-
     if notional < min_order_quote:
-        return {
-            "action": "lock",
-            "reason": f"Below minimum order quote: {notional:.2f} < {min_order_quote:.2f}",
-            "recommended_amount": round(asset_amount, 6),
-            "risk_pct": round(final_risk_pct * 100, 2),
-            "notional_value": round(notional, 2),
-            "sl_distance_pct": round(abs(current_price - (stop_loss_value or 0)) / current_price * 100, 2) if stop_loss_value else 0,
-            "liquidity_penalty": liquidity_penalty < 1.0,
-        }
+        # If the account can afford the minimum, we bump it to the minimum 
+        # instead of locking. This is crucial for small accounts ($20-$50).
+        if free_balance >= min_order_quote:
+            asset_amount = min_order_quote / current_price
+            notional = min_order_quote
+        else:
+            return {
+                "action": "lock",
+                "reason": f"Below minimum order quote: {notional:.2f} < {min_order_quote:.2f}",
+                "recommended_amount": round(asset_amount, 6),
+                "risk_pct": round(final_risk_pct * 100, 2),
+                "notional_value": round(notional, 2),
+                "sl_distance_pct": round(abs(current_price - (stop_loss_value or 0)) / current_price * 100, 2) if stop_loss_value else 0,
+                "liquidity_penalty": liquidity_penalty < 1.0,
+            }
 
     return {
         "action":           "trade",

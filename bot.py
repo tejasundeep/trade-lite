@@ -149,11 +149,11 @@ class TradeXProClone:
             max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 0.05),
         )
         self.risk = MarketRiskManager(MarketRiskConfig(
-            max_risk_per_trade_pct=_env_float("MAX_RISK_PER_TRADE_PCT", 0.015),
-            max_position_pct=_env_float("MAX_POSITION_PCT", 0.15),
+            max_risk_per_trade_pct=_env_float("MAX_RISK_PER_TRADE_PCT", 0.05),
+            max_position_pct=_env_float("MAX_POSITION_PCT", 0.60),
             min_order_quote=_env_float("MIN_ORDER_QUOTE", 10.0),
-            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 0.05),
-            cooldown_minutes=_env_int("COOLDOWN_MINUTES", 45)
+            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 0.15),
+            cooldown_minutes=_env_int("COOLDOWN_MINUTES", 10)
         ))
         self.engine = TradingEngine(self.tools, self.risk)
         self.backtester = BacktestEngine(self.engine, self.tools)

@@ -5,16 +5,19 @@ def analyze_smc_structure(htf_structure: str = "Neutral", df_override=None) -> d
     if df is None or df.empty or len(df) < 50:
         return {"error": "Insufficient market data for SMC"}
 
-    # 1. Improved Pivot Detection (Vectorized-ish)
+    # 1. Improved Pivot Detection (Fixed Look-Ahead Bias)
     def get_swings(data, window=5):
         highs = data['high'].values
         lows = data['low'].values
         swings_h, swings_l = [], []
         
+        # ELITE FIX: Swings can only be identified AFTER they are confirmed
+        # i must be far enough back that [i+window] is STILL in the past relative to the latest candle
         for i in range(window, len(data) - window):
-            if all(highs[i] > highs[i-window:i]) and all(highs[i] > highs[i+1:i+window+1]):
+            # Check if index i is a local peak/trough
+            if all(highs[i] >= highs[i-window:i]) and all(highs[i] > highs[i+1:i+window+1]):
                 swings_h.append({"price": highs[i], "index": i})
-            if all(lows[i] < lows[i-window:i]) and all(lows[i] < lows[i+1:i+window+1]):
+            if all(lows[i] <= lows[i-window:i]) and all(lows[i] < lows[i+1:i+window+1]):
                 swings_l.append({"price": lows[i], "index": i})
         return swings_h, swings_l
 

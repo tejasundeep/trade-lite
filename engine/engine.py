@@ -163,21 +163,35 @@ class TradingEngine:
         macro = await get_macro_analysis()
         
         # Pre-trade Balance Gate: Don't even try if balance is critically low
-        if balance < 1.0: # Minimum safety floor
-            log.debug("Balance too low ($%.2f) to consider new trades.", balance)
-            state.update({"decision": {"action": "hold", "reason": "Insufficient Balance"}})
-            return state
-
+        # 2. ANALYZE — ELITE CACHING GATE
+        # Logic: Don't hammer external APIs every 5s for data that changes slowly.
+        
+        # Open Interest (5m Cache)
+        oi_data = state.get("last_oi_data")
+        last_oi_time = state.get("last_oi_update", 0)
         adapter = getattr(self.tools, "adapter", None)
+        if not oi_data or (time.time() - last_oi_time > 300):
+            from indicators.order_flow import analyze_open_interest
+            oi_data = analyze_open_interest(symbol, adapter)
+            state["last_oi_data"] = oi_data
+            state["last_oi_update"] = time.time()
+
+        from indicators.stochastic import calculate_stochastic
+        rsi_data = calculate_rsi()
+        stoch_data = calculate_stochastic()
+        
         indicators = {
             "smc":        analyze_smc_structure(htf_structure=htf_bias),
             "order_flow": analyze_order_flow(symbol, adapter, streamer),
+            "oi":         oi_data,
             "vwap":       calculate_vwap_analysis(),
             "liquidity":  calculate_liquidity_map(),
             "macro":      macro,
             "trend":      analyze_trend_strength(),
             "vol":        analyze_volatility(),
-            "rsi":        calculate_rsi(),
+            "rsi":        rsi_data.get("value", 50.0),
+            "rsi_series": rsi_data.get("series", []),
+            "stoch":      stoch_data,
             "macd":       calculate_macd(),
             "bollinger":  calculate_bollinger(),
         }
@@ -237,6 +251,17 @@ class TradingEngine:
         # Elite Data Extraction
         vol_data = indicators.get("vol", {})
         atr_pct  = vol_data.get("atr_pct", 1.0)
+        
+        # --- ELITE SAFEGUARD: Volatility Circuit Breaker ---
+        # If the market is too volatile (e.g., News spikes), technical indicators are noise.
+        df = state.get("df")
+        if df is not None and not df.empty:
+            avg_atr = df["high"].tail(20).max() - df["low"].tail(20).min()
+            current_atr = vol_data.get("atr", 0)
+            if current_atr > avg_atr * 2.5:
+                 state["decision"] = {"action": "hold", "reason": "Circuit Breaker: Extreme Volatility detected (News Shock?)"}
+                 return state
+
         of_data  = indicators.get("order_flow", {})
         
         # Zero-Latency Spread
@@ -253,16 +278,35 @@ class TradingEngine:
         if of_data.get("iceberg") != "None":
             confidence = min(1.0, confidence + 0.05)
 
+        # --- ELITE SAFEGUARD: Portfolio Correlation Guard ---
+        try:
+            all_positions = self.tools.adapter.get_positions()
+            if len(all_positions) >= 3 and not position:
+                state["decision"] = {"action": "hold", "reason": "Portfolio Guard: Max concurrent positions reached"}
+                return state
+        except: pass
+
         if position:
             position_side = str(position.get("side", "")).lower()
             current_amount = float(position.get("amount", 0.0) or 0.0)
             current_notional = current_amount * price
-            exposure_cap = balance * getattr(self.risk_manager.config, "max_position_pct", 0.15)
+            exposure_cap = balance * getattr(self.risk_manager.config, "max_position_pct", 0.60)
+            
+            # POSITION FLIPPING LOGIC
+            is_conflict = (position_side == "long" and selected["action"] == "sell") or (position_side == "short" and selected["action"] == "buy")
+            if is_conflict and confidence > 0.85:
+                state["decision"] = {
+                    "action": "close",
+                    "reason": f"Conflict Flip: Consensus strongly shifted to {selected['action']}",
+                    "amount": current_amount
+                }
+                return state
+
             same_direction = (position_side == "long" and selected["action"] == "buy") or (position_side == "short" and selected["action"] == "sell")
             if same_direction and current_notional >= exposure_cap * 0.9:
                 state["decision"] = {
                     "action": "hold",
-                    "reason": "Existing position already near exposure cap; skipping add-on",
+                    "reason": "Existing position already near exposure cap",
                 }
                 return state
 
@@ -276,8 +320,8 @@ class TradingEngine:
             historical_win_rate = metrics.get("win_rate", 0.55),
             total_trades     = metrics.get("total_trades", 0),
             spread_bps       = spread_bps,
-            max_risk_per_trade_pct = getattr(self.risk_manager.config, "max_risk_per_trade_pct", 0.015),
-            max_position_pct = getattr(self.risk_manager.config, "max_position_pct", 0.15),
+            max_risk_per_trade_pct = getattr(self.risk_manager.config, "max_risk_per_trade_pct", 0.05),
+            max_position_pct = getattr(self.risk_manager.config, "max_position_pct", 0.60),
             min_order_quote  = getattr(self.risk_manager.config, "min_order_quote", 10.0),
         )
 

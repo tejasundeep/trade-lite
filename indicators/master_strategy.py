@@ -95,4 +95,31 @@ class MasterInstitutionalStrategy:
                 "setup": "silver_bullet"
             }
 
+        # --- STRATEGY 4: TREND SCALPER (Higher Frequency) ---
+        # Look for EMA alignment + RSI for quick scalps when no SMC setup is present
+        ema_50 = df["EMA_50"].iloc[-1] if "EMA_50" in df.columns else None
+        ema_200 = df["EMA_200"].iloc[-1] if "EMA_200" in df.columns else None
+        price = df["close"].iloc[-1]
+        
+        if ema_50 and ema_200:
+            # Bullish: Price > EMA 50 > EMA 200 (Uptrend)
+            if price > ema_50 > ema_200:
+                return {
+                    "action": "buy",
+                    "reason": "Trend Scalper: Bullish EMA Alignment",
+                    "confidence": 0.75,
+                    "indicators": {"smc": smc, "of": of},
+                    "setup": "scalper"
+                }
+            # Bearish: Price < EMA 50 < EMA 200 (Downtrend)
+            elif price < ema_50 < ema_200:
+                return {
+                    "action": "sell",
+                    "reason": "Trend Scalper: Bearish EMA Alignment",
+                    "confidence": 0.75,
+                    "indicators": {"smc": smc, "of": of},
+                    "setup": "scalper"
+                }
+
+
         return {"action": "wait", "reason": "No high-probability setup found"}
